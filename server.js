@@ -9,7 +9,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
-// Vamos listar todos os arquivos que o Render está vendo na pasta atual
+// Lista os arquivos na pasta do Render para debug
 console.log('=== LISTA DE ARQUIVOS NA PASTA DO RENDER ===');
 try {
   const arquivosNaPasta = fs.readdirSync(__dirname);
@@ -31,7 +31,7 @@ const keyPath = fs.existsSync('/etc/secrets/efi_key.pem')
 console.log('Caminho final do Certificado:', certPath);
 console.log('Caminho final da Chave:', keyPath);
 
-// Tenta carregar os certificados com segurança para o app não explodir
+// Carrega os certificados com segurança
 let httpsAgent;
 try {
   httpsAgent = new https.Agent({
@@ -44,7 +44,7 @@ try {
   console.error('>>> ERRO: Falha ao carregar os certificados (.pem):', err.message);
 }
 
-// URLs oficiais atualizadas de Homologação da Efí (Sandbox)
+// URLs oficiais de Homologação da Efí (Sandbox)
 const EFI_AUTH_URL = 'https://pix-h.api.efipay.com.br/oauth/token';
 const EFI_COB_URL = 'https://pix-h.api.efipay.com.br/v2/cob';
 
@@ -72,30 +72,35 @@ async function obterTokenEfi() {
   return response.data.access_token;
 }
 
-// Rota que o seu aplicativo Flutter está chamando
+// Rota chamada pelo aplicativo Flutter
 app.post('/gerar-pix', async (req, res) => {
   try {
-    const { valor, cpf, nome, descricao } = req.body;
+    const { valor, cpf, nome } = req.body;
 
     if (!valor || !cpf) {
       return res.status(400).json({ error: 'Valor e CPF são obrigatórios.' });
     }
 
+    if (!process.env.EFI_PIX_KEY) {
+      return res.status(500).json({ error: 'Variável EFI_PIX_KEY não configurada no Render.' });
+    }
+
     // 1. Pega o token OAuth da Efí
     const accessToken = await obterTokenEfi();
 
-    // 2. Monta o payload da cobrança Pix incluindo a Chave Pix obrigatória
+    // 2. Monta o payload estritamente com os campos obrigatórios da Efí
     const payloadCob = {
-      calendario: { expiracao: 3600 },
+      calendario: { 
+        expiracao: 3600 
+      },
+      valor: { 
+        original: Number(valor).toFixed(2) 
+      },
+      chave: process.env.EFI_PIX_KEY,
       devedor: {
         cpf: cpf.replace(/\D/g, ''),
         nome: nome || 'Cliente Ache Obra',
-      },
-      valor: {
-        original: Number(valor).toFixed(2),
-      },
-      chave: process.env.EFI_PIX_KEY, // <-- Sua Chave Pix cadastrada na Efí
-      solicitacao: descricao || 'Assinatura Ache Obra',
+      }
     };
 
     // 3. Cria a cobrança Pix na Efí

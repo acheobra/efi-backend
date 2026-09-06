@@ -9,22 +9,31 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
-// Diagnóstico imediato para ver se os certificados existem no Render
+// Vamos listar todos os arquivos que o Render está vendo na pasta atual
+console.log('=== LISTA DE ARQUIVOS NA PASTA DO RENDER ===');
+try {
+  const arquivosNaPasta = fs.readdirSync(__dirname);
+  console.log(arquivosNaPasta);
+} catch (e) {
+  console.log('Erro ao ler diretório:', e.message);
+}
+console.log('============================================');
+
 const certPath = path.join(__dirname, 'efi_cert.pem');
 const keyPath = path.join(__dirname, 'efi_key.pem');
 
-console.log('--- DIAGNÓSTICO DE CERTIFICADOS ---');
-console.log('Caminho do Cert:', certPath, '-> Existe?', fs.existsSync(certPath));
-console.log('Caminho da Chave:', keyPath, '-> Existe?', fs.existsSync(keyPath));
-console.log('CLIENT_ID configurado?', !!process.env.EFI_CLIENT_ID);
-console.log('-----------------------------------');
-
-// Configuração mTLS com caminhos robustos para os certificados
-const httpsAgent = new https.Agent({
-  cert: fs.readFileSync(certPath),
-  key: fs.readFileSync(keyPath),
-  rejectUnauthorized: false,
-});
+// Tenta carregar os certificados com segurança para o app não explodir
+let httpsAgent;
+try {
+  httpsAgent = new https.Agent({
+    cert: fs.readFileSync(certPath),
+    key: fs.readFileSync(keyPath),
+    rejectUnauthorized: false,
+  });
+  console.log('>>> Certificados carregados com sucesso! <<<');
+} catch (err) {
+  console.error('>>> ERRO: Falha ao carregar os certificados (.pem):', err.message);
+}
 
 // URLs oficiais atualizadas de Homologação da Efí (Sandbox)
 const EFI_AUTH_URL = 'https://pix-h.api.efipay.com.br/oauth/token';
@@ -32,6 +41,10 @@ const EFI_COB_URL = 'https://pix-h.api.efipay.com.br/v2/cob';
 
 // Função para obter o Token de Acesso da Efí via mTLS
 async function obterTokenEfi() {
+  if (!httpsAgent) {
+    throw new Error('Agente HTTPS não inicializado devido à falta de certificados.');
+  }
+
   const credentials = Buffer.from(
     `${process.env.EFI_CLIENT_ID}:${process.env.EFI_CLIENT_SECRET}`
   ).toString('base64');

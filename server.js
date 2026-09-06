@@ -2,22 +2,23 @@ const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
 const https = require('https');
+const path = require('path');
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
-// Configuração mTLS usando os certificados na raiz do projeto
+// Configuração mTLS com caminhos robustos para os certificados
 const httpsAgent = new https.Agent({
-  cert: fs.readFileSync('./efi_cert.pem'),
-  key: fs.readFileSync('./efi_key.pem'),
+  cert: fs.readFileSync(path.join(__dirname, 'efi_cert.pem')),
+  key: fs.readFileSync(path.join(__dirname, 'efi_key.pem')),
   rejectUnauthorized: false,
 });
 
-// URLs de Homologação da Efí (Sandbox)
-const EFI_AUTH_URL = 'https://api-pix-h.gerencianet.com.br/oauth/token';
-const EFI_COB_URL = 'https://api-pix-h.gerencianet.com.br/v2/cob';
+// URLs oficiais atualizadas de Homologação da Efí (Sandbox)
+const EFI_AUTH_URL = 'https://pix-h.api.efipay.com.br/oauth/token';
+const EFI_COB_URL = 'https://pix-h.api.efipay.com.br/v2/cob';
 
 // Função para obter o Token de Acesso da Efí via mTLS
 async function obterTokenEfi() {
@@ -82,7 +83,7 @@ app.post('/gerar-pix', async (req, res) => {
     // 4. Busca o QR Code (pixCopiaECola) gerado para essa cobrança
     const responseQr = await axios({
       method: 'GET',
-      url: `https://api-pix-h.gerencianet.com.br/v2/loc/${cobData.loc.id}`,
+      url: `https://pix-h.api.efipay.com.br/v2/loc/${cobData.loc.id}`,
       headers: {
         Authorization: `Bearer ${accessToken}`,
       },
@@ -99,7 +100,7 @@ app.post('/gerar-pix', async (req, res) => {
   } catch (error) {
     console.error('Erro ao gerar Pix:', error.response?.data || error.message);
     return res.status(500).json({
-      error: error.response?.data?.mensaje || error.response?.data?.message || error.toString(),
+      error: error.response?.data?.mensagem || error.response?.data?.message || error.toString(),
     });
   }
 });

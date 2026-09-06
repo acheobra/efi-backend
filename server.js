@@ -9,16 +9,6 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
-// Lista os arquivos na pasta do Render para debug
-console.log('=== LISTA DE ARQUIVOS NA PASTA DO RENDER ===');
-try {
-  const arquivosNaPasta = fs.readdirSync(__dirname);
-  console.log(arquivosNaPasta);
-} catch (e) {
-  console.log('Erro ao ler diretório:', e.message);
-}
-console.log('============================================');
-
 // Verifica se os certificados estão nos Secret Files do Render ou na pasta local
 const certPath = fs.existsSync('/etc/secrets/efi_cert.pem') 
   ? '/etc/secrets/efi_cert.pem' 
@@ -27,9 +17,6 @@ const certPath = fs.existsSync('/etc/secrets/efi_cert.pem')
 const keyPath = fs.existsSync('/etc/secrets/efi_key.pem') 
   ? '/etc/secrets/efi_key.pem' 
   : path.join(__dirname, 'efi_key.pem');
-
-console.log('Caminho final do Certificado:', certPath);
-console.log('Caminho final da Chave:', keyPath);
 
 // Carrega os certificados com segurança
 let httpsAgent;
@@ -75,7 +62,7 @@ async function obterTokenEfi() {
 // Rota chamada pelo aplicativo Flutter
 app.post('/gerar-pix', async (req, res) => {
   try {
-    const { valor, cpf, nome } = req.body;
+    const { valor, cpf, nome, descricao } = req.body;
 
     if (!valor || !cpf) {
       return res.status(400).json({ error: 'Valor e CPF são obrigatórios.' });
@@ -88,7 +75,7 @@ app.post('/gerar-pix', async (req, res) => {
     // 1. Pega o token OAuth da Efí
     const accessToken = await obterTokenEfi();
 
-    // 2. Monta o payload estritamente com os campos obrigatórios da Efí
+    // 2. Monta o payload da cobrança Pix
     const payloadCob = {
       calendario: { 
         expiracao: 3600 
@@ -117,22 +104,35 @@ app.post('/gerar-pix', async (req, res) => {
 
     const cobData = responseCob.data;
     const txid = cobData.txid;
+    const locId = cobData.loc?.id;
+
+    if (!locId) {
+      throw new Error('A Efí não retornou o ID de localidade (loc.id) para esta cobrança.');
+    }
 
     // 4. Busca o QR Code (pixCopiaECola) gerado para essa cobrança
     const responseQr = await axios({
       method: 'GET',
-      url: `https://pix-h.api.efipay.com.br/v2/loc/${cobData.loc.id}`,
+      url: `https://pix-h.api.efipay.com.br/v2/loc/${locId}`,
       headers: {
         Authorization: `Bearer ${accessToken}`,
       },
       httpsAgent,
     });
 
-    // 5. Retorna os dados para o aplicativo Flutter
+    console.log('RESPOSTA LOC EFÍ RECEBIDA:', JSON.stringify(responseQr.data));
+
+    const copiaECola = responseQr.data.pixCopiaECola || responseQr.data.pix_copia_e_cola;
+
+    if (!copiaECola) {
+      throw new Error('A Efí não retornou o código Pix Copia e Cola.');
+    }
+
+    // 5. Retorna os dados para o aplicativo Flutter com o pix_copia_e_cola garantido
     return res.json({
       success: true,
       txid: txid,
-      pix_copia_e_cola: responseQr.data.pixCopiaECola,
+      pix_copia_e_cola: copiaECola,
     });
 
   } catch (error) {

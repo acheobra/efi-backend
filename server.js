@@ -9,10 +9,20 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
+// Diagnóstico imediato para ver se os certificados existem no Render
+const certPath = path.join(__dirname, 'efi_cert.pem');
+const keyPath = path.join(__dirname, 'efi_key.pem');
+
+console.log('--- DIAGNÓSTICO DE CERTIFICADOS ---');
+console.log('Caminho do Cert:', certPath, '-> Existe?', fs.existsSync(certPath));
+console.log('Caminho da Chave:', keyPath, '-> Existe?', fs.existsSync(keyPath));
+console.log('CLIENT_ID configurado?', !!process.env.EFI_CLIENT_ID);
+console.log('-----------------------------------');
+
 // Configuração mTLS com caminhos robustos para os certificados
 const httpsAgent = new https.Agent({
-  cert: fs.readFileSync(path.join(__dirname, 'efi_cert.pem')),
-  key: fs.readFileSync(path.join(__dirname, 'efi_key.pem')),
+  cert: fs.readFileSync(certPath),
+  key: fs.readFileSync(keyPath),
   rejectUnauthorized: false,
 });
 

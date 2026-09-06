@@ -19,8 +19,17 @@ try {
 }
 console.log('============================================');
 
-const certPath = path.join(__dirname, 'efi_cert.pem');
-const keyPath = path.join(__dirname, 'efi_key.pem');
+// Verifica se os certificados estão nos Secret Files do Render ou na pasta local
+const certPath = fs.existsSync('/etc/secrets/efi_cert.pem') 
+  ? '/etc/secrets/efi_cert.pem' 
+  : path.join(__dirname, 'efi_cert.pem');
+
+const keyPath = fs.existsSync('/etc/secrets/efi_key.pem') 
+  ? '/etc/secrets/efi_key.pem' 
+  : path.join(__dirname, 'efi_key.pem');
+
+console.log('Caminho final do Certificado:', certPath);
+console.log('Caminho final da Chave:', keyPath);
 
 // Tenta carregar os certificados com segurança para o app não explodir
 let httpsAgent;

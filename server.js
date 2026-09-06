@@ -15,9 +15,9 @@ const httpsAgent = new https.Agent({
   rejectUnauthorized: false,
 });
 
-// URLs de Homologação da Efí (Sandbox)
-const EFI_AUTH_URL = 'https://api-pix-h.gerencianet.com.br/oauth/token';
-const EFI_COB_URL = 'https://api-pix-h.gerencianet.com.br/v2/cob';
+// URLs de Produção da Efí (Mude para -h se estiver usando ambiente de Homologação/Sandbox)
+const EFI_AUTH_URL = 'https://api-pix.gerencianet.com.br/oauth/token';
+const EFI_COB_URL = 'https://api-pix.gerencianet.com.br/v2/cob';
 
 // Função para obter o Token de Acesso da Efí via mTLS
 async function obterTokenEfi() {
@@ -82,7 +82,7 @@ app.post('/gerar-pix', async (req, res) => {
     // 4. Busca o QR Code (pixCopiaECola) gerado para essa cobrança
     const responseQr = await axios({
       method: 'GET',
-      url: `https://api-pix-h.gerencianet.com.br/v2/loc/${cobData.loc.id}`,
+      url: `https://api-pix.gerencianet.com.br/v2/loc/${cobData.loc.id}`,
       headers: {
         Authorization: `Bearer ${accessToken}`,
       },

@@ -84,7 +84,7 @@ app.post('/gerar-pix', async (req, res) => {
     // 1. Pega o token OAuth da Efí
     const accessToken = await obterTokenEfi();
 
-    // 2. Monta o payload da cobrança Pix com a chave correta 'solicitacao'
+    // 2. Monta o payload da cobrança Pix incluindo a Chave Pix obrigatória
     const payloadCob = {
       calendario: { expiracao: 3600 },
       devedor: {
@@ -94,6 +94,7 @@ app.post('/gerar-pix', async (req, res) => {
       valor: {
         original: Number(valor).toFixed(2),
       },
+      chave: process.env.EFI_PIX_KEY, // <-- Sua Chave Pix cadastrada na Efí
       solicitacao: descricao || 'Assinatura Ache Obra',
     };
 
@@ -137,7 +138,7 @@ app.post('/gerar-pix', async (req, res) => {
   }
 });
 
-// Inicializa el servidor na porta do Render
+// Inicializa o servidor na porta do Render
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
 });

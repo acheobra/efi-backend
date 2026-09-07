@@ -163,7 +163,7 @@ app.post('/gerar-pix', async (req, res) => {
   }
 });
 
-// ==================== 2. ROTA CARTÃO AVULSO (ATUALIZADA PARA /CHARGES) ====================
+// ==================== 2. ROTA CARTÃO AVULSO (ONE-STEP) ====================
 app.post('/cobrar-cartao', async (req, res) => {
   try {
     const {
@@ -185,57 +185,45 @@ app.post('/cobrar-cartao', async (req, res) => {
 
     const accessToken = await obterTokenCobranca();
 
-    // Passo 1: Criar cobrança avulsa usando /charges (plural)
-    console.log('Criando cobrança avulsa na Efí');
-    const responseCharge = await axios({
-      method: 'POST',
-      url: `${EFI_API_V1_URL}/charges`,
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      data: {
-        items: [{ name: descricao || 'Serviço Ache Obra', value: Math.round(Number(valor) * 100), amount: 1 }]
-      },
-      httpsAgent,
-    });
-
-    const chargeId = responseCharge.data?.data?.charge_id || responseCharge.data?.charge_id;
-    if (!chargeId) {
-      throw new Error('ID da cobrança não retornado pela Efí.');
-    }
-
-    // Passo 2: Pagar cobrança com cartão
-    console.log(`Efetuando pagamento da cobrança ${chargeId} com cartão`);
+    console.log('Processando cobrança avulsa via One-Step na Efí');
     const responsePay = await axios({
       method: 'POST',
-      url: `${EFI_API_V1_URL}/charge/${chargeId}/pay`,
+      url: `${EFI_API_V1_URL}/charge/one-step`,
       headers: {
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
       },
       data: {
-        credit_card: {
-          customer: {
-            name: nome,
-            email: email,
-            cpf: cpf.replace(/\D/g, ''),
-            birth_date: '1990-01-01',
-            phone_number: '42999999999'
-          },
-          billing_address: {
-            street: 'Rua Principal',
-            number: '123',
-            neighborhood: 'Centro',
-            zipcode: '85200000',
-            city: 'Pitanga',
-            state: 'PR'
-          },
-          installments: installments || 1,
-          card_number: cartao_numero,
-          expiration_month: cartao_mes,
-          expiration_year: cartao_ano,
-          cvv: cartao_cvv
+        items: [
+          {
+            name: descricao || 'Serviço Ache Obra',
+            value: Math.round(Number(valor) * 100),
+            amount: 1
+          }
+        ],
+        payment: {
+          credit_card: {
+            customer: {
+              name: nome,
+              email: email,
+              cpf: cpf.replace(/\D/g, ''),
+              birth_date: '1990-01-01',
+              phone_number: '42999999999'
+            },
+            billing_address: {
+              street: 'Rua Principal',
+              number: '123',
+              neighborhood: 'Centro',
+              zipcode: '85200000',
+              city: 'Pitanga',
+              state: 'PR'
+            },
+            installments: installments || 1,
+            card_number: cartao_numero,
+            expiration_month: cartao_mes,
+            expiration_year: cartao_ano,
+            cvv: cartao_cvv
+          }
         }
       },
       httpsAgent,

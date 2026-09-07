@@ -41,13 +41,13 @@ try {
   console.error('>>> ERRO: Falha ao carregar os certificados (.pem):', err.message);
 }
 
-// URLs específicas para cada módulo da Efí
+// URLs específicas e oficiais para cada módulo da Efí
 const EFI_PIX_AUTH_URL = 'https://pix-h.api.efipay.com.br/oauth/token';
 const EFI_PIX_COB_URL = 'https://pix-h.api.efipay.com.br/v2/cob';
 
-// CORRIGIDO: Domínio correto para API v1 (Cartões e Assinaturas) da Efí
-const EFI_COBRANCA_AUTH_URL = 'https://api-h.efipay.com.br/oauth/token';
-const EFI_API_V1_URL = 'https://api-h.efipay.com.br/v1';
+// Domínio oficial da Efí para API Cobranças e Cartões (Homologação)
+const EFI_COBRANCA_AUTH_URL = 'https://cobrancas-h.api.efipay.com.br/oauth/token';
+const EFI_API_V1_URL = 'https://cobrancas-h.api.efipay.com.br/v1';
 
 // Token exclusivo para o Pix
 async function obterTokenPix() {
@@ -93,7 +93,7 @@ async function obterTokenCobranca() {
   return response.data.access_token;
 }
 
-// ==================== 1. ROTA PIX (INTACTA) ====================
+// ==================== 1. ROTA PIX (100% INTACTA) ====================
 app.post('/gerar-pix', async (req, res) => {
   try {
     const { valor, cpf, nome } = req.body;
@@ -164,7 +164,7 @@ app.post('/gerar-pix', async (req, res) => {
   }
 });
 
-// ==================== 2. ROTA CARTÃO AVULSO ====================
+// ==================== 2. ROTA CARTÃO AVULSO (CORRIGIDA) ====================
 app.post('/cobrar-cartao', async (req, res) => {
   try {
     const {
@@ -186,7 +186,7 @@ app.post('/cobrar-cartao', async (req, res) => {
 
     const accessToken = await obterTokenCobranca();
 
-    // Passo 1: Criar cobrança avulsa
+    // Passo 1: Criar cobrança avulsa (/v1/charge no singular)
     console.log('Criando cobrança avulsa na Efí');
     const responseCharge = await axios({
       method: 'POST',

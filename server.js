@@ -44,7 +44,7 @@ try {
 const EFI_AUTH_URL = 'https://pix-h.api.efipay.com.br/oauth/token';
 const EFI_COB_URL = 'https://pix-h.api.efipay.com.br/v2/cob';
 
-// URL base corrigida para API v1 (Cartões e Assinaturas - Sandbox/Homologação)
+// URL base para API v1 (Cartões e Assinaturas - Sandbox/Homologação)
 const EFI_API_V1_URL = 'https://cobrancas-h.api.efipay.com.br/v1';
 
 async function obterTokenEfi() {
@@ -216,12 +216,12 @@ app.post('/cobrar-cartao', async (req, res) => {
       });
 
     } else {
-      // Cobrança Avulsa de Cartão (One-Step / Charge)
+      // Cobrança Avulsa de Cartão (Corrigido para /one-step com hífen)
       console.log('Processando cobrança avulsa de cartão');
 
       const responseAvulso = await axios({
         method: 'POST',
-        url: `${EFI_API_V1_URL}/charge/oneStep`,
+        url: `${EFI_API_V1_URL}/charge/one-step`,
         headers: {
           Authorization: `Bearer ${accessToken}`,
           'Content-Type': 'application/json',

@@ -7,17 +7,6 @@ const path = require('path');
 const app = express();
 app.use(express.json());
 
-// Middleware CORS para suportar requisições do Flutter Web e Celular
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
-  next();
-});
-
 const PORT = process.env.PORT || 10000;
 
 // Verifica se os certificados estão nos Secret Files do Render ou na pasta local
@@ -44,9 +33,6 @@ try {
 const EFI_AUTH_URL = 'https://pix-h.api.efipay.com.br/oauth/token';
 const EFI_COB_URL = 'https://pix-h.api.efipay.com.br/v2/cob';
 
-// URL base para API v1 (Cartões e Assinaturas - Sandbox/Homologação)
-const EFI_API_V1_URL = 'https://cobrancas-h.api.efipay.com.br/v1';
-
 async function obterTokenEfi() {
   if (!httpsAgent) {
     throw new Error('Agente HTTPS não inicializado devido à falta de certificados.');
@@ -70,7 +56,6 @@ async function obterTokenEfi() {
   return response.data.access_token;
 }
 
-// ==================== ROTA PIX ====================
 app.post('/gerar-pix', async (req, res) => {
   try {
     const { valor, cpf, nome } = req.body;
@@ -116,6 +101,7 @@ app.post('/gerar-pix', async (req, res) => {
 
     let copiaECola = cobData.pixCopiaECola || cobData.pix_copia_e_cola;
 
+    // Se o pixCopiaECola não veio direto na criação, consultamos a rota de localidade
     if (!copiaECola && locId) {
       const responseQr = await axios({
         method: 'GET',
@@ -130,8 +116,9 @@ app.post('/gerar-pix', async (req, res) => {
       copiaECola = responseQr.data.pixCopiaECola || responseQr.data.pix_copia_e_cola;
     }
 
+    // Fallback de segurança caso a Efí ainda não retorne o copia e cola na homologação
     if (!copiaECola) {
-      console.log('AVISO: Usando string de homologação simulada para evitar travamento.');
+      console.is('AVISO: Usando string de homologação simulada para evitar travamento.');
       copiaECola = `00020126580014br.gov.bcb.pix0136${process.env.EFI_PIX_KEY}5204000053039865802BR5925${nome || 'Cliente'}6009Pitanga62070503***6304`;
     }
 
@@ -143,149 +130,6 @@ app.post('/gerar-pix', async (req, res) => {
 
   } catch (error) {
     console.error('Erro ao gerar Pix:', error.response?.data || error.message);
-    return res.status(500).json({
-      error: error.response?.data?.mensagem || error.response?.data?.message || error.toString(),
-    });
-  }
-});
-
-// ==================== ROTA CARTÃO (AVULSO E RECORRENTE) ====================
-app.post('/cobrar-cartao', async (req, res) => {
-  try {
-    const {
-      usuario_id,
-      valor,
-      email,
-      nome,
-      cpf,
-      descricao,
-      eh_recorrente,
-      cartao_numero,
-      cartao_mes,
-      cartao_ano,
-      cartao_cvv,
-      installments,
-      plan_id
-    } = req.body;
-
-    if (!cartao_numero || !cartao_mes || !cartao_ano || !cartao_cvv) {
-      return res.status(400).json({ error: 'Dados do cartão incompletos.' });
-    }
-
-    const accessToken = await obterTokenEfi();
-
-    // Se for recorrente e possuir plan_id da Efí
-    if (eh_recorrente && plan_id) {
-      console.log(`Processando assinatura recorrente para o plano ${plan_id}`);
-
-      const responseAssinatura = await axios({
-        method: 'POST',
-        url: `${EFI_API_V1_URL}/subscription/${plan_id}/pay`,
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          'Content-Type': 'application/json',
-        },
-        data: {
-          items: [{ name: descricao || 'Assinatura Ache Obra', value: Math.round(Number(valor) * 100), amount: 1 }],
-          customer: {
-            name: nome,
-            email: email,
-            cpf: cpf.replace(/\D/g, ''),
-          },
-          credit_card: {
-            installments: installments || 1,
-            billing_address: {
-              street: 'Rua Principal',
-              number: '123',
-              neighborhood: 'Centro',
-              zipcode: '85200000',
-              city: 'Pitanga',
-              state: 'PR'
-            },
-            card_number: cartao_numero,
-            expiration_month: cartao_mes,
-            expiration_year: cartao_ano,
-            cvv: cartao_cvv
-          }
-        },
-        httpsAgent,
-      });
-
-      return res.json({
-        success: true,
-        status: responseAssinatura.data?.data?.status || 'ACTIVE',
-        pago: true,
-        data: responseAssinatura.data
-      });
-
-    } else {
-      // 1. Passo: Criar a cobrança avulsa
-      console.log('Criando cobrança avulsa na Efí');
-      const responseCharge = await axios({
-        method: 'POST',
-        url: `${EFI_API_V1_URL}/charge`,
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          'Content-Type': 'application/json',
-        },
-        data: {
-          items: [{ name: descricao || 'Serviço Ache Obra', value: Math.round(Number(valor) * 100), amount: 1 }]
-        },
-        httpsAgent,
-      });
-
-      const chargeId = responseCharge.data?.data?.charge_id || responseCharge.data?.charge_id;
-
-      if (!chargeId) {
-        throw new Error('Cobrança criada, mas ID não retornado pela Efí.');
-      }
-
-      // 2. Passo: Pagar a cobrança com Cartão de Crédito
-      console.log(`Efetuando pagamento da cobrança ${chargeId} com cartão`);
-      const responsePay = await axios({
-        method: 'POST',
-        url: `${EFI_API_V1_URL}/charge/${chargeId}/pay`,
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          'Content-Type': 'application/json',
-        },
-        data: {
-          credit_card: {
-            customer: {
-              name: nome,
-              email: email,
-              cpf: cpf.replace(/\D/g, ''),
-              birth_date: '1990-01-01',
-              phone_number: '42999999999'
-            },
-            billing_address: {
-              street: 'Rua Principal',
-              number: '123',
-              neighborhood: 'Centro',
-              zipcode: '85200000',
-              city: 'Pitanga',
-              state: 'PR'
-            },
-            installments: installments || 1,
-            card_number: cartao_numero,
-            expiration_month: cartao_mes,
-            expiration_year: cartao_ano,
-            cvv: cartao_cvv
-          }
-        },
-        httpsAgent,
-      });
-
-      return res.json({
-        success: true,
-        status: responsePay.data?.data?.status || responsePay.data?.status || 'PAID',
-        pago: true,
-        data: responsePay.data
-      });
-    }
-
-  } catch (error) {
-    console.error('Erro ao processar cartão:', error.response?.data || error.message);
     return res.status(500).json({
       error: error.response?.data?.mensagem || error.response?.data?.message || error.toString(),
     });

@@ -96,7 +96,7 @@ async function obterTokenCobranca() {
 // ==================== 1. ROTA PIX (100% INTACTA) ====================
 app.post('/gerar-pix', async (req, res) => {
   try {
-    const { valor, cpf, nome } = req.body;
+    const { valor, cpf, nome, descricao } = req.body;
 
     if (!valor || !cpf) {
       return res.status(400).json({ error: 'Valor e CPF são obrigatórios.' });
@@ -164,30 +164,19 @@ app.post('/gerar-pix', async (req, res) => {
   }
 });
 
-// ==================== 2. ROTA CARTÃO AVULSO (CORRIGIDA) ====================
+// ==================== 2. ROTA CARTÃO / CHECKOUT LINK ====================
 app.post('/cobrar-cartao', async (req, res) => {
   try {
-    const {
-      valor,
-      email,
-      nome,
-      cpf,
-      descricao,
-      cartao_numero,
-      cartao_mes,
-      cartao_ano,
-      cartao_cvv,
-      installments
-    } = req.body;
+    const { valor, email, nome, cpf, descricao } = req.body;
 
-    if (!cartao_numero || !cartao_mes || !cartao_ano || !cartao_cvv) {
-      return res.status(400).json({ error: 'Dados do cartão incompletos.' });
+    if (!valor || !cpf) {
+      return res.status(400).json({ error: 'Valor e CPF são obrigatórios.' });
     }
 
     const accessToken = await obterTokenCobranca();
 
-    // Passo 1: Criar cobrança avulsa (/v1/charge no singular)
-    console.log('Criando cobrança avulsa na Efí');
+    // Passo 1: Criar a cobrança na API v1
+    console.log('Criando cobrança para link de pagamento na Efí');
     const responseCharge = await axios({
       method: 'POST',
       url: `${EFI_API_V1_URL}/charge`,
@@ -196,7 +185,7 @@ app.post('/cobrar-cartao', async (req, res) => {
         'Content-Type': 'application/json',
       },
       data: {
-        items: [{ name: descricao || 'Serviço Ache Obra', value: Math.round(Number(valor) * 100), amount: 1 }]
+        items: [{ name: descricao || 'Plano Ache Obra', value: Math.round(Number(valor) * 100), amount: 1 }]
       },
       httpsAgent,
     });
@@ -206,129 +195,36 @@ app.post('/cobrar-cartao', async (req, res) => {
       throw new Error('ID da cobrança não retornado pela Efí.');
     }
 
-    // Passo 2: Pagar cobrança com cartão
-    console.log(`Efetuando pagamento da cobrança ${chargeId} com cartão`);
-    const responsePay = await axios({
+    // Passo 2: Gerar o Link de Pagamento associado à cobrança
+    console.log(`Gerando link de pagamento para a cobrança ${chargeId}`);
+    const responseLink = await axios({
       method: 'POST',
-      url: `${EFI_API_V1_URL}/charge/${chargeId}/pay`,
+      url: `${EFI_API_V1_URL}/charge/${chargeId}/link`,
       headers: {
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
       },
       data: {
-        credit_card: {
-          customer: {
-            name: nome,
-            email: email,
-            cpf: cpf.replace(/\D/g, ''),
-            birth_date: '1990-01-01',
-            phone_number: '42999999999'
-          },
-          billing_address: {
-            street: 'Rua Principal',
-            number: '123',
-            neighborhood: 'Centro',
-            zipcode: '85200000',
-            city: 'Pitanga',
-            state: 'PR'
-          },
-          installments: installments || 1,
-          card_number: cartao_numero,
-          expiration_month: cartao_mes,
-          expiration_year: cartao_ano,
-          cvv: cartao_cvv
-        }
+        billet_adv: { discount: 0 },
+        card: {}
       },
       httpsAgent,
     });
 
-    return res.json({
-      success: true,
-      status: responsePay.data?.data?.status || responsePay.data?.status || 'PAID',
-      pago: true,
-      data: responsePay.data
-    });
+    const paymentUrl = responseLink.data?.data?.payment_url || responseLink.data?.payment_url || responseLink.data?.data?.pdf || responseLink.data?.charge_link;
 
-  } catch (error) {
-    console.error('Erro ao processar cartão avulso:', error.response?.data || error.message);
-    return res.status(500).json({
-      error: error.response?.data?.mensagem || error.response?.data?.message || error.toString(),
-    });
-  }
-});
-
-// ==================== 3. ROTA CARTÃO RECORRENTE (ASSINATURA) ====================
-app.post('/cobrar-assinatura', async (req, res) => {
-  try {
-    const {
-      valor,
-      email,
-      nome,
-      cpf,
-      descricao,
-      plan_id,
-      cartao_numero,
-      cartao_mes,
-      cartao_ano,
-      cartao_cvv,
-      installments
-    } = req.body;
-
-    if (!plan_id) {
-      return res.status(400).json({ error: 'ID do plano de assinatura não informado.' });
+    if (!paymentUrl) {
+      throw new Error('Link de pagamento não retornado pela Efí.');
     }
-
-    if (!cartao_numero || !cartao_mes || !cartao_ano || !cartao_cvv) {
-      return res.status(400).json({ error: 'Dados do cartão incompletos.' });
-    }
-
-    const accessToken = await obterTokenCobranca();
-
-    console.log(`Processando assinatura recorrente para o plano ${plan_id}`);
-    const responseAssinatura = await axios({
-      method: 'POST',
-      url: `${EFI_API_V1_URL}/subscription/${plan_id}/pay`,
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      data: {
-        items: [{ name: descricao || 'Assinatura Ache Obra', value: Math.round(Number(valor) * 100), amount: 1 }],
-        customer: {
-          name: nome,
-          email: email,
-          cpf: cpf.replace(/\D/g, ''),
-          birth_date: '1990-01-01',
-          phone_number: '42999999999'
-        },
-        credit_card: {
-          installments: installments || 1,
-          billing_address: {
-            street: 'Rua Principal',
-            number: '123',
-            neighborhood: 'Centro',
-            zipcode: '85200000',
-            city: 'Pitanga',
-            state: 'PR'
-          },
-          card_number: cartao_numero,
-          expiration_month: cartao_mes,
-          expiration_year: cartao_ano,
-          cvv: cartao_cvv
-        }
-      },
-      httpsAgent,
-    });
 
     return res.json({
       success: true,
-      status: responseAssinatura.data?.data?.status || 'ACTIVE',
-      pago: true,
-      data: responseAssinatura.data
+      payment_url: paymentUrl,
+      charge_id: chargeId
     });
 
   } catch (error) {
-    console.error('Erro ao processar assinatura:', error.response?.data || error.message);
+    console.error('Erro ao gerar link de pagamento:', error.response?.data || error.message);
     return res.status(500).json({
       error: error.response?.data?.mensagem || error.response?.data?.message || error.toString(),
     });

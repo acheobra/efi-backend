@@ -195,14 +195,17 @@ app.post('/cobrar-cartao', async (req, res) => {
           credit_card: {
             installments: installments || 1,
             billing_address: {
-              street: 'Endereço padrão',
+              street: 'Rua Principal',
               number: '123',
               neighborhood: 'Centro',
               zipcode: '85200000',
               city: 'Pitanga',
               state: 'PR'
             },
-            payment_token: 'TOKEN_GERADO_OU_DADOS_DIRETOS'
+            card_number: cartao_numero,
+            expiration_month: cartao_mes,
+            expiration_year: cartao_ano,
+            cvv: cartao_cvv
           }
         },
         httpsAgent,
@@ -216,28 +219,58 @@ app.post('/cobrar-cartao', async (req, res) => {
       });
 
     } else {
-      // Cobrança Avulsa de Cartão (Corrigido para /one-step com hífen)
-      console.log('Processando cobrança avulsa de cartão');
-
-      const responseAvulso = await axios({
+      // 1. Passo: Criar a cobrança avulsa
+      console.log('Criando cobrança avulsa na Efí');
+      const responseCharge = await axios({
         method: 'POST',
-        url: `${EFI_API_V1_URL}/charge/one-step`,
+        url: `${EFI_API_V1_URL}/charge`,
         headers: {
           Authorization: `Bearer ${accessToken}`,
           'Content-Type': 'application/json',
         },
         data: {
-          items: [{ name: descricao || 'Serviço Ache Obra', value: Math.round(Number(valor) * 100), amount: 1 }],
-          customer: {
-            name: nome,
-            email: email,
-            cpf: cpf.replace(/\D/g, ''),
-          },
-          billing: {
-            credit_card: {
-              installments: installments || 1,
-              payment_token: 'TOKEN_GERADO_OU_DADOS_DIRETOS'
-            }
+          items: [{ name: descricao || 'Serviço Ache Obra', value: Math.round(Number(valor) * 100), amount: 1 }]
+        },
+        httpsAgent,
+      });
+
+      const chargeId = responseCharge.data?.data?.charge_id || responseCharge.data?.charge_id;
+
+      if (!chargeId) {
+        throw new Error('Cobrança criada, mas ID não retornado pela Efí.');
+      }
+
+      // 2. Passo: Pagar a cobrança com Cartão de Crédito
+      console.log(`Efetuando pagamento da cobrança ${chargeId} com cartão`);
+      const responsePay = await axios({
+        method: 'POST',
+        url: `${EFI_API_V1_URL}/charge/${chargeId}/pay`,
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        data: {
+          credit_card: {
+            customer: {
+              name: nome,
+              email: email,
+              cpf: cpf.replace(/\D/g, ''),
+              birth_date: '1990-01-01',
+              phone_number: '42999999999'
+            },
+            billing_address: {
+              street: 'Rua Principal',
+              number: '123',
+              neighborhood: 'Centro',
+              zipcode: '85200000',
+              city: 'Pitanga',
+              state: 'PR'
+            },
+            installments: installments || 1,
+            card_number: cartao_numero,
+            expiration_month: cartao_mes,
+            expiration_year: cartao_ano,
+            cvv: cartao_cvv
           }
         },
         httpsAgent,
@@ -245,9 +278,9 @@ app.post('/cobrar-cartao', async (req, res) => {
 
       return res.json({
         success: true,
-        status: responseAvulso.data?.data?.status || 'PAID',
+        status: responsePay.data?.data?.status || responsePay.data?.status || 'PAID',
         pago: true,
-        data: responseAvulso.data
+        data: responsePay.data
       });
     }
 

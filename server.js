@@ -44,8 +44,8 @@ try {
 const EFI_AUTH_URL = 'https://pix-h.api.efipay.com.br/oauth/token';
 const EFI_COB_URL = 'https://pix-h.api.efipay.com.br/v2/cob';
 
-// URLs base para API v1 (Cartões e Assinaturas - Sandbox/Homologação)
-const EFI_API_V1_URL = 'https://api-h.efipay.com.br/v1';
+// URL base corrigida para API v1 (Cartões e Assinaturas - Sandbox/Homologação)
+const EFI_API_V1_URL = 'https://cobrancas-h.api.efipay.com.br/v1';
 
 async function obterTokenEfi() {
   if (!httpsAgent) {
@@ -178,7 +178,6 @@ app.post('/cobrar-cartao', async (req, res) => {
     if (eh_recorrente && plan_id) {
       console.log(`Processando assinatura recorrente para o plano ${plan_id}`);
 
-      // Exemplo de chamada para criação/pagamento de assinatura na API v1 da Efí
       const responseAssinatura = await axios({
         method: 'POST',
         url: `${EFI_API_V1_URL}/subscription/${plan_id}/pay`,
@@ -203,7 +202,7 @@ app.post('/cobrar-cartao', async (req, res) => {
               city: 'Pitanga',
               state: 'PR'
             },
-            payment_token: 'TOKEN_GERADO_OU_DADOS_DIRETOS' // Ajuste conforme a modalidade de tokenização da Efí
+            payment_token: 'TOKEN_GERADO_OU_DADOS_DIRETOS'
           }
         },
         httpsAgent,
@@ -237,7 +236,7 @@ app.post('/cobrar-cartao', async (req, res) => {
           billing: {
             credit_card: {
               installments: installments || 1,
-              payment_token: 'TOKEN_GERADO_OU_DADOS_DIRETOS' // Ajuste conforme a tokenização do seu front/back
+              payment_token: 'TOKEN_GERADO_OU_DADOS_DIRETOS'
             }
           }
         },

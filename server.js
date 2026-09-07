@@ -92,7 +92,7 @@ async function obterTokenCobranca() {
   return response.data.access_token;
 }
 
-// ==================== 1. ROTA PIX ====================
+// ==================== 1. ROTA PIX (INTACTA) ====================
 app.post('/gerar-pix', async (req, res) => {
   try {
     const { valor, cpf, nome } = req.body;
@@ -163,7 +163,7 @@ app.post('/gerar-pix', async (req, res) => {
   }
 });
 
-// ==================== 2. ROTA CARTÃO AVULSO ====================
+// ==================== 2. ROTA CARTÃO AVULSO (ATUALIZADA PARA /CHARGES) ====================
 app.post('/cobrar-cartao', async (req, res) => {
   try {
     const {
@@ -185,11 +185,11 @@ app.post('/cobrar-cartao', async (req, res) => {
 
     const accessToken = await obterTokenCobranca();
 
-    // Passo 1: Criar cobrança avulsa
+    // Passo 1: Criar cobrança avulsa usando /charges (plural)
     console.log('Criando cobrança avulsa na Efí');
     const responseCharge = await axios({
       method: 'POST',
-      url: `${EFI_API_V1_URL}/charge`,
+      url: `${EFI_API_V1_URL}/charges`,
       headers: {
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',

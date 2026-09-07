@@ -125,6 +125,64 @@ function obterCredenciais() {
 }
 
 // ============================================================
+// CORREÇÃO / NORMALIZAÇÃO DO CUSTOM_ID DA EFÍ
+// ============================================================
+//
+// A Efí aceita somente caracteres compatíveis com:
+// letras, números, "_" e "-".
+//
+// O código anterior utilizava "|" para separar os dados.
+// Exemplo:
+//
+// acheobra|user-UUID|tipo-plano
+//
+// O caractere "|" é rejeitado pela Efí.
+//
+// Agora qualquer informação utilizada no custom_id é
+// sanitizada antes de ser enviada.
+// ============================================================
+
+function limparCustomId(valor) {
+
+  return String(valor ?? '')
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[-_]+|[-_]+$/g, '');
+}
+
+function montarCustomId({
+  usuario_id,
+  origem_tipo,
+  origem_id,
+  prefixo = 'acheobra',
+}) {
+
+  const partes = [
+    limparCustomId(prefixo),
+
+    usuario_id
+      ? `user-${limparCustomId(usuario_id)}`
+      : null,
+
+    origem_tipo
+      ? `tipo-${limparCustomId(origem_tipo)}`
+      : null,
+
+    origem_id
+      ? `origem-${limparCustomId(origem_id)}`
+      : null,
+  ].filter(Boolean);
+
+  const resultado =
+    partes
+      .join('-')
+      .substring(0, 255);
+
+  return resultado || 'acheobra';
+}
+
+// ============================================================
 // TOKEN PIX
 // ============================================================
 
@@ -141,8 +199,7 @@ async function obterTokenPix() {
 
   const response =
     await axios({
-      method:
-        'POST',
+      method: 'POST',
 
       url:
         EFI_PIX_AUTH_URL,
@@ -190,8 +247,7 @@ async function obterTokenCobranca() {
 
   const response =
     await axios({
-      method:
-        'POST',
+      method: 'POST',
 
       url:
         EFI_COBRANCA_AUTH_URL,
@@ -297,8 +353,7 @@ async function buscarPlanosRecorrentesSupabase() {
 
   const response =
     await axios({
-      method:
-        'GET',
+      method: 'GET',
 
       url:
         `${supabaseUrl}/rest/v1/tab_planos`,
@@ -340,8 +395,7 @@ async function atualizarPlanoSupabase(
 
   const response =
     await axios({
-      method:
-        'PATCH',
+      method: 'PATCH',
 
       url:
         `${supabaseUrl}/rest/v1/tab_planos`,
@@ -377,6 +431,7 @@ async function atualizarPlanoSupabase(
 // ============================================================
 //
 // Incluímos o UUID interno do Supabase no nome.
+//
 // Assim, se houver falha após criar na Efí e antes de gravar
 // efi_plan_id no banco, uma nova sincronização consegue localizar
 // o plano já criado e evita duplicidade.
@@ -408,8 +463,7 @@ async function localizarPlanoEfiPorNome(
 
   const response =
     await axios({
-      method:
-        'GET',
+      method: 'GET',
 
       url:
         `${EFI_COBRANCA_API_URL}/plans`,
@@ -474,8 +528,7 @@ async function criarPlanoMensalEfi(
 
   const response =
     await axios({
-      method:
-        'POST',
+      method: 'POST',
 
       url:
         `${EFI_COBRANCA_API_URL}/plan`,
@@ -568,6 +621,7 @@ function validarSyncSecret(req) {
 }
 
 // Impede duas sincronizações simultâneas na mesma instância.
+
 let sincronizacaoPlanosEmAndamento =
   false;
 
@@ -588,6 +642,7 @@ let sincronizacaoPlanosEmAndamento =
 // Bearer <SYNC_PLANOS_SECRET>
 //
 // Funcionamento:
+//
 // 1. Lê tab_planos com valor_recorrente > 0.
 // 2. Se já possui efi_plan_id, não cria novamente.
 // 3. Se não possui, procura na Efí pelo nome determinístico.
@@ -629,7 +684,6 @@ app.post(
           });
       }
 
-      // Valida as variáveis antes de começar.
       obterConfiguracaoSupabase();
 
       sincronizacaoPlanosEmAndamento =
@@ -656,11 +710,8 @@ app.post(
       const resultados = [];
 
       let criados = 0;
-
       let reaproveitados = 0;
-
       let jaSincronizados = 0;
-
       let erros = 0;
 
       for (
@@ -730,11 +781,6 @@ app.post(
           console.log(
             `>>> Sincronizando plano: ${nomePlano}`
           );
-
-          // ----------------------------------------------------
-          // Primeiro procura na Efí para evitar duplicação
-          // em caso de retry após falha anterior.
-          // ----------------------------------------------------
 
           let planoEfi =
             await localizarPlanoEfiPorNome(
@@ -1227,7 +1273,7 @@ app.post(
       );
 
       // --------------------------------------------------------
-      // Validações
+      // VALIDAÇÕES
       // --------------------------------------------------------
 
       if (!valor) {
@@ -1335,7 +1381,6 @@ app.post(
         String(telefone)
           .replace(/\D/g, '');
 
-      // Se vier com código do Brasil, remove o 55.
       if (
         telefoneLimpo
           .startsWith('55') &&
@@ -1373,35 +1418,25 @@ app.post(
           : 1;
 
       // --------------------------------------------------------
-      // Metadata
+      // METADATA - CUSTOM_ID CORRIGIDO
       // --------------------------------------------------------
-
-      const customIdParts = [
-        'acheobra',
-
-        usuario_id
-          ? `user-${usuario_id}`
-          : null,
-
-        origem_tipo
-          ? `tipo-${origem_tipo}`
-          : null,
-
-        origem_id
-          ? `origem-${origem_id}`
-          : null,
-      ].filter(Boolean);
 
       const customId =
-        customIdParts
-          .join('|')
-          .substring(
-            0,
-            255
-          );
+        montarCustomId({
+          usuario_id,
+          origem_tipo,
+          origem_id,
+          prefixo:
+            'acheobra-pagamento',
+        });
+
+      console.log(
+        '>>> Custom ID:',
+        customId
+      );
 
       // --------------------------------------------------------
-      // Payload oficial da cobrança de cartão
+      // PAYLOAD OFICIAL DA COBRANÇA DE CARTÃO
       // --------------------------------------------------------
 
       const payload = {
@@ -1421,8 +1456,7 @@ app.post(
 
         metadata: {
           custom_id:
-            customId ||
-            'pagamento-ache-obra',
+            customId,
         },
 
         payment: {
@@ -1724,7 +1758,7 @@ app.post(
       );
 
       // --------------------------------------------------------
-      // Validações
+      // VALIDAÇÕES
       // --------------------------------------------------------
 
       if (!plan_id) {
@@ -1911,35 +1945,25 @@ app.post(
         await obterTokenCobranca();
 
       // --------------------------------------------------------
-      // Metadata
+      // METADATA - CUSTOM_ID CORRIGIDO
       // --------------------------------------------------------
-
-      const customIdParts = [
-        'acheobra',
-
-        usuario_id
-          ? `user-${usuario_id}`
-          : null,
-
-        origem_tipo
-          ? `tipo-${origem_tipo}`
-          : null,
-
-        origem_id
-          ? `origem-${origem_id}`
-          : null,
-      ].filter(Boolean);
 
       const customId =
-        customIdParts
-          .join('|')
-          .substring(
-            0,
-            255
-          );
+        montarCustomId({
+          usuario_id,
+          origem_tipo,
+          origem_id,
+          prefixo:
+            'acheobra-assinatura',
+        });
+
+      console.log(
+        '>>> Custom ID da assinatura:',
+        customId
+      );
 
       // --------------------------------------------------------
-      // Payload da assinatura
+      // PAYLOAD DA ASSINATURA
       // --------------------------------------------------------
 
       const payload = {
@@ -1959,8 +1983,7 @@ app.post(
 
         metadata: {
           custom_id:
-            customId ||
-            'assinatura-ache-obra',
+            customId,
         },
 
         payment: {

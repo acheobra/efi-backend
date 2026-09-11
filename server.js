@@ -344,6 +344,89 @@ function obterHeadersSupabase() {
  
  
 // ============================================================
+// SUPABASE - PAGAMENTOS AVULSOS
+// ============================================================
+
+function normalizarUuidOuNull(valor) {
+  const texto = String(valor ?? '').trim();
+
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    .test(texto)
+      ? texto
+      : null;
+}
+
+async function inserirPagamentoAvulsoSupabase(dados) {
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+
+  const response = await axios({
+    method: 'POST',
+    url: `${supabaseUrl}/rest/v1/tab_pagamentos_avulsos`,
+    headers: {
+      ...obterHeadersSupabase(),
+      Prefer: 'return=representation',
+    },
+    data: dados,
+    timeout: 30000,
+  });
+
+  return Array.isArray(response.data)
+    ? response.data[0] || null
+    : null;
+}
+
+async function buscarPagamentoAvulsoCartaoPorIdUsuario(
+  pagamentoId,
+  usuarioId
+) {
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+
+  const response = await axios({
+    method: 'GET',
+    url: `${supabaseUrl}/rest/v1/tab_pagamentos_avulsos`,
+    params: {
+      select: '*',
+      id: `eq.${pagamentoId}`,
+      usuario_id: `eq.${usuarioId}`,
+      tipo_pagamento: 'eq.cartao',
+      limit: 1,
+    },
+    headers: obterHeadersSupabase(),
+    timeout: 30000,
+  });
+
+  return Array.isArray(response.data)
+    ? response.data[0] || null
+    : null;
+}
+
+async function atualizarPagamentoAvulsoPorId(
+  pagamentoId,
+  dados
+) {
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+
+  const response = await axios({
+    method: 'PATCH',
+    url: `${supabaseUrl}/rest/v1/tab_pagamentos_avulsos`,
+    params: {
+      id: `eq.${pagamentoId}`,
+    },
+    headers: {
+      ...obterHeadersSupabase(),
+      Prefer: 'return=representation',
+    },
+    data: dados,
+    timeout: 30000,
+  });
+
+  return Array.isArray(response.data)
+    ? response.data[0] || null
+    : null;
+}
+
+
+// ============================================================
 // SUPABASE - ASSINATURAS / WEBHOOK / STATUS
 // ============================================================
  
@@ -2066,6 +2149,49 @@ app.post(
           'approved' ||
         status ===
           'paid';
+
+      let pagamentoAvulsoSalvo = null;
+      let erroRegistroPagamentoAvulso = null;
+
+      if (
+        aprovado &&
+        usuario_id &&
+        chargeId
+      ) {
+        try {
+          pagamentoAvulsoSalvo =
+            await inserirPagamentoAvulsoSupabase({
+              usuario_id: String(usuario_id),
+              origem_tipo: origem_tipo ? String(origem_tipo) : null,
+              origem_id: normalizarUuidOuNull(origem_id),
+              tipo_pagamento: 'cartao',
+              valor: valorNumerico,
+              efi_charge_id: String(chargeId),
+              pix_txid: null,
+              pix_e2e_id: null,
+              status: 'pago',
+              data_pagamento: new Date().toISOString(),
+              estorno_solicitado_em: null,
+              estorno_concluido_em: null,
+              motivo_cancelamento: null,
+            });
+
+          console.log(
+            '>>> Pagamento avulso registrado no Supabase:',
+            pagamentoAvulsoSalvo?.id || 'ID não retornado'
+          );
+        } catch (erroRegistroPagamento) {
+          erroRegistroPagamentoAvulso =
+            erroRegistroPagamento.response?.data ||
+            erroRegistroPagamento.message;
+
+          console.error(
+            '>>> Cobrança aprovada na Efí, mas falhou ao registrar em tab_pagamentos_avulsos:',
+            erroRegistroPagamentoAvulso
+          );
+        }
+      }
+
  
       return res.json({
         success:
@@ -2080,7 +2206,18 @@ app.post(
         charge_id:
           chargeId,
  
-        status:
+        
+        pagamento_avulso_id:
+          pagamentoAvulsoSalvo?.id ||
+          null,
+
+        registro_pagamento_salvo:
+          pagamentoAvulsoSalvo != null,
+
+        erro_registro_pagamento:
+          erroRegistroPagamentoAvulso,
+
+status:
           status,
  
         payment:
@@ -2966,6 +3103,276 @@ app.post(
 );
  
 // ============================================================
+// 5. ESTORNO DE PAGAMENTO AVULSO NO CARTÃO
+// ============================================================
+
+app.post(
+  '/cancelar-pagamento-cartao',
+
+  async (req, res) => {
+    try {
+      const usuario =
+        await obterUsuarioSupabaseDoBearer(req);
+
+      if (!usuario?.id) {
+        return res.status(401).json({
+          success: false,
+          error: 'Usuário não autenticado.',
+        });
+      }
+
+      const pagamentoId =
+        String(req.body?.pagamento_id || '').trim();
+
+      const motivoCancelamento =
+        String(
+          req.body?.motivo_cancelamento ||
+          'Cancelamento solicitado pelo usuário dentro do prazo de 7 dias.'
+        )
+          .trim()
+          .substring(0, 1000);
+
+      if (!pagamentoId) {
+        return res.status(400).json({
+          success: false,
+          error: 'pagamento_id é obrigatório.',
+        });
+      }
+
+      const pagamento =
+        await buscarPagamentoAvulsoCartaoPorIdUsuario(
+          pagamentoId,
+          usuario.id
+        );
+
+      if (!pagamento) {
+        return res.status(404).json({
+          success: false,
+          error:
+            'Pagamento avulso de cartão não encontrado para este usuário.',
+        });
+      }
+
+      const statusLocal =
+        String(pagamento.status || '')
+          .trim()
+          .toLowerCase();
+
+      if (
+        statusLocal === 'estornado' ||
+        statusLocal === 'refunded'
+      ) {
+        return res.json({
+          success: true,
+          ja_estornado: true,
+          status: 'estornado',
+          pagamento_id: pagamento.id,
+          charge_id: pagamento.efi_charge_id,
+        });
+      }
+
+      const dataPagamentoTexto =
+        pagamento.data_pagamento ||
+        pagamento.created_at;
+
+      const dataPagamento =
+        dataPagamentoTexto
+          ? new Date(dataPagamentoTexto)
+          : null;
+
+      if (
+        !dataPagamento ||
+        Number.isNaN(dataPagamento.getTime())
+      ) {
+        return res.status(409).json({
+          success: false,
+          error:
+            'A data do pagamento não está disponível ou é inválida.',
+        });
+      }
+
+      const agora = new Date();
+
+      const limiteEstorno =
+        new Date(
+          dataPagamento.getTime() +
+          7 * 24 * 60 * 60 * 1000
+        );
+
+      if (agora > limiteEstorno) {
+        return res.status(409).json({
+          success: false,
+          prazo_expirado: true,
+          error:
+            'O prazo de 7 dias para solicitar o cancelamento deste pagamento já expirou.',
+          data_pagamento:
+            dataPagamento.toISOString(),
+          limite_cancelamento:
+            limiteEstorno.toISOString(),
+        });
+      }
+
+      const chargeId =
+        String(pagamento.efi_charge_id || '').trim();
+
+      if (!chargeId) {
+        return res.status(409).json({
+          success: false,
+          error:
+            'O pagamento não possui efi_charge_id para solicitar o estorno.',
+        });
+      }
+
+      const accessToken =
+        await obterTokenCobranca();
+
+      const consultaCharge =
+        await axios({
+          method: 'GET',
+          url:
+            `${EFI_COBRANCA_API_URL}/charge/${encodeURIComponent(
+              chargeId
+            )}`,
+          headers: {
+            Authorization:
+              `Bearer ${accessToken}`,
+            'Content-Type':
+              'application/json',
+          },
+          httpsAgent,
+          timeout: 30000,
+        });
+
+      const statusEfi =
+        String(
+          consultaCharge.data?.data?.status || ''
+        )
+          .trim()
+          .toLowerCase();
+
+      console.log(
+        `>>> Estorno cartão avulso. Pagamento ${pagamentoId}. Charge ${chargeId}. Status Efí: ${statusEfi}.`
+      );
+
+      if (statusEfi === 'refunded') {
+        const atualizado =
+          await atualizarPagamentoAvulsoPorId(
+            pagamento.id,
+            {
+              status: 'estornado',
+              estorno_concluido_em:
+                new Date().toISOString(),
+              motivo_cancelamento:
+                motivoCancelamento,
+            }
+          );
+
+        return res.json({
+          success: true,
+          ja_estornado: true,
+          status: 'estornado',
+          pagamento: atualizado,
+        });
+      }
+
+      if (statusEfi !== 'paid') {
+        return res.status(409).json({
+          success: false,
+          error:
+            `A cobrança ainda não está disponível para estorno. Status atual na Efí: ${statusEfi || 'desconhecido'}.`,
+          status_efi:
+            statusEfi || null,
+          charge_id:
+            chargeId,
+        });
+      }
+
+      const respostaEstorno =
+        await axios({
+          method: 'POST',
+          url:
+            `${EFI_COBRANCA_API_URL}/charge/card/${encodeURIComponent(
+              chargeId
+            )}/refund`,
+          headers: {
+            Authorization:
+              `Bearer ${accessToken}`,
+            'Content-Type':
+              'application/json',
+          },
+          data: {},
+          httpsAgent,
+          timeout: 30000,
+        });
+
+      const pagamentoAtualizado =
+        await atualizarPagamentoAvulsoPorId(
+          pagamento.id,
+          {
+            status: 'estorno_solicitado',
+            estorno_solicitado_em:
+              new Date().toISOString(),
+            motivo_cancelamento:
+              motivoCancelamento,
+          }
+        );
+
+      return res.json({
+        success: true,
+        status: 'estorno_solicitado',
+        mensagem:
+          'Solicitação de estorno enviada à Efí. O reembolso está em processamento.',
+        pagamento_id:
+          pagamento.id,
+        charge_id:
+          chargeId,
+        data_pagamento:
+          dataPagamento.toISOString(),
+        limite_cancelamento:
+          limiteEstorno.toISOString(),
+        pagamento:
+          pagamentoAtualizado,
+        efi:
+          respostaEstorno.data,
+      });
+
+    } catch (error) {
+      console.error(
+        '>>> ERRO AO ESTORNAR PAGAMENTO AVULSO NO CARTÃO:',
+        error.response?.data ||
+        error.message
+      );
+
+      const respostaEfi =
+        error.response?.data;
+
+      let mensagem =
+        respostaEfi?.error_description ||
+        respostaEfi?.mensagem ||
+        respostaEfi?.message ||
+        respostaEfi?.error ||
+        error.message;
+
+      if (typeof mensagem !== 'string') {
+        mensagem =
+          JSON.stringify(mensagem);
+      }
+
+      return res
+        .status(error.response?.status || 500)
+        .json({
+          success: false,
+          error: mensagem,
+          efi:
+            respostaEfi ||
+            null,
+        });
+    }
+  }
+);
+
+
+// ============================================================
 // 5. CANCELAMENTO DA ASSINATURA PELO USUÁRIO
 // ============================================================
 //
@@ -3460,6 +3867,9 @@ app.get(
  
         webhook_efi:
           '/webhook/efi',
+ 
+        cancelar_pagamento_cartao:
+          '/cancelar-pagamento-cartao',
  
         cancelar_assinatura:
           '/cancelar-assinatura',

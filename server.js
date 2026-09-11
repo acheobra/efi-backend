@@ -427,6 +427,92 @@ async function atualizarPagamentoAvulsoPorId(
 
 
 // ============================================================
+// ESTORNO PENDENTE - PAGAMENTOS AVULSOS NO CARTÃO
+// ============================================================
+
+async function buscarPagamentoAvulsoCartaoPorChargeId(chargeId) {
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+  const response = await axios({
+    method: 'GET',
+    url: `${supabaseUrl}/rest/v1/tab_pagamentos_avulsos`,
+    params: {
+      select: '*',
+      efi_charge_id: `eq.${chargeId}`,
+      tipo_pagamento: 'eq.cartao',
+      limit: 1,
+    },
+    headers: obterHeadersSupabase(),
+    timeout: 30000,
+  });
+  return Array.isArray(response.data) ? response.data[0] || null : null;
+}
+
+async function solicitarEstornoCartaoEfi(accessToken, chargeId) {
+  return axios({
+    method: 'POST',
+    url: `${EFI_COBRANCA_API_URL}/charge/card/${encodeURIComponent(chargeId)}/refund`,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    data: {},
+    httpsAgent,
+    timeout: 30000,
+  });
+}
+
+async function processarEstornoPendentePorChargeId(chargeId, statusEfiInformado = null) {
+  const id = String(chargeId || '').trim();
+  if (!id) return { processado: false, motivo: 'charge_id_ausente' };
+
+  const pagamento = await buscarPagamentoAvulsoCartaoPorChargeId(id);
+  if (!pagamento) return { processado: false, motivo: 'pagamento_avulso_nao_encontrado' };
+
+  const statusLocal = String(pagamento.status || '').trim().toLowerCase();
+  if (statusLocal === 'estornado' || statusLocal === 'refunded') {
+    return { processado: true, ja_estornado: true, pagamento_id: pagamento.id };
+  }
+  if (statusLocal !== 'estorno_pendente') {
+    return { processado: false, motivo: 'sem_estorno_pendente', status_local: statusLocal };
+  }
+
+  const accessToken = await obterTokenCobranca();
+  let statusEfi = String(statusEfiInformado || '').trim().toLowerCase();
+  if (!statusEfi) {
+    const consulta = await axios({
+      method: 'GET',
+      url: `${EFI_COBRANCA_API_URL}/charge/${encodeURIComponent(id)}`,
+      headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+      httpsAgent,
+      timeout: 30000,
+    });
+    statusEfi = String(consulta.data?.data?.status || '').trim().toLowerCase();
+  }
+
+  console.log(`>>> Processando estorno pendente. Pagamento ${pagamento.id}. Charge ${id}. Status Efí: ${statusEfi}.`);
+
+  if (statusEfi === 'refunded') {
+    const atualizado = await atualizarPagamentoAvulsoPorId(pagamento.id, {
+      status: 'estornado',
+      estorno_concluido_em: new Date().toISOString(),
+    });
+    return { processado: true, ja_estornado: true, pagamento: atualizado };
+  }
+
+  if (statusEfi !== 'paid') {
+    return { processado: false, aguardando_paid: true, status_efi: statusEfi || null };
+  }
+
+  const respostaEstorno = await solicitarEstornoCartaoEfi(accessToken, id);
+  const atualizado = await atualizarPagamentoAvulsoPorId(pagamento.id, {
+    status: 'estorno_solicitado',
+    estorno_solicitado_em: pagamento.estorno_solicitado_em || new Date().toISOString(),
+  });
+  console.log(`>>> Estorno pendente enviado à Efí. Pagamento ${pagamento.id}. Charge ${id}.`);
+  return { processado: true, status: 'estorno_solicitado', pagamento: atualizado, efi: respostaEstorno.data };
+}
+
+// ============================================================
 // SUPABASE - ASSINATURAS / WEBHOOK / STATUS
 // ============================================================
  
@@ -764,11 +850,34 @@ async function aplicarEventoNotificacaoEfi(
   const chargeId =
     evento?.identifiers?.charge_id;
  
+  // Eventos sem subscription_id podem pertencer a cobranças avulsas.
+  // Se houver um estorno pendente e a cobrança chegar a paid, dispara o refund.
   if (!subscriptionId) {
-    return {
-      ignorado: true,
-      motivo: 'evento_sem_subscription_id',
-    };
+    if (chargeId) {
+      try {
+        const resultadoEstorno = await processarEstornoPendentePorChargeId(
+          String(chargeId),
+          statusAtual
+        );
+        return {
+          ignorado: !resultadoEstorno?.processado,
+          tipo,
+          status: statusAtual,
+          charge_id: String(chargeId),
+          estorno_avulso: resultadoEstorno,
+        };
+      } catch (error) {
+        console.error('>>> Erro ao processar estorno pendente pelo webhook:', error.response?.data || error.message);
+        return {
+          ignorado: false,
+          tipo,
+          status: statusAtual,
+          charge_id: String(chargeId),
+          erro_estorno_avulso: error.response?.data || error.message,
+        };
+      }
+    }
+    return { ignorado: true, motivo: 'evento_sem_subscription_id_e_sem_charge_id' };
   }
  
   const assinatura =
@@ -3108,269 +3217,126 @@ app.post(
 
 app.post(
   '/cancelar-pagamento-cartao',
-
   async (req, res) => {
+    console.log('==========================================');
+    console.log('>>> SOLICITAÇÃO DE CANCELAMENTO CARTÃO AVULSO');
+    console.log('>>> Body:', req.body);
+    console.log('==========================================');
+
     try {
-      const usuario =
-        await obterUsuarioSupabaseDoBearer(req);
-
+      const usuario = await obterUsuarioSupabaseDoBearer(req);
       if (!usuario?.id) {
-        return res.status(401).json({
-          success: false,
-          error: 'Usuário não autenticado.',
-        });
+        console.warn('>>> Cancelamento recusado: usuário não autenticado.');
+        return res.status(401).json({ success: false, error: 'Usuário não autenticado.' });
       }
+      console.log('>>> Usuário autenticado:', usuario.id);
 
-      const pagamentoId =
-        String(req.body?.pagamento_id || '').trim();
-
-      const motivoCancelamento =
-        String(
-          req.body?.motivo_cancelamento ||
-          'Cancelamento solicitado pelo usuário dentro do prazo de 7 dias.'
-        )
-          .trim()
-          .substring(0, 1000);
+      const pagamentoId = String(req.body?.pagamento_id || '').trim();
+      const motivoCancelamento = String(
+        req.body?.motivo_cancelamento || 'Cancelamento solicitado pelo usuário dentro do prazo de 7 dias.'
+      ).trim().substring(0, 1000);
 
       if (!pagamentoId) {
-        return res.status(400).json({
-          success: false,
-          error: 'pagamento_id é obrigatório.',
-        });
+        return res.status(400).json({ success: false, error: 'pagamento_id é obrigatório.' });
       }
 
-      const pagamento =
-        await buscarPagamentoAvulsoCartaoPorIdUsuario(
-          pagamentoId,
-          usuario.id
-        );
-
+      const pagamento = await buscarPagamentoAvulsoCartaoPorIdUsuario(pagamentoId, usuario.id);
+      console.log('>>> Pagamento localizado:', pagamento?.id || 'não encontrado');
       if (!pagamento) {
-        return res.status(404).json({
-          success: false,
-          error:
-            'Pagamento avulso de cartão não encontrado para este usuário.',
-        });
+        return res.status(404).json({ success: false, error: 'Pagamento avulso de cartão não encontrado para este usuário.' });
       }
 
-      const statusLocal =
-        String(pagamento.status || '')
-          .trim()
-          .toLowerCase();
+      const statusLocal = String(pagamento.status || '').trim().toLowerCase();
+      console.log('>>> Status local:', statusLocal || 'não informado');
 
-      if (
-        statusLocal === 'estornado' ||
-        statusLocal === 'refunded'
-      ) {
-        return res.json({
-          success: true,
-          ja_estornado: true,
-          status: 'estornado',
-          pagamento_id: pagamento.id,
-          charge_id: pagamento.efi_charge_id,
-        });
+      if (statusLocal === 'estornado' || statusLocal === 'refunded') {
+        return res.json({ success: true, ja_estornado: true, status: 'estornado', pagamento_id: pagamento.id, charge_id: pagamento.efi_charge_id });
+      }
+      if (statusLocal === 'estorno_solicitado') {
+        return res.json({ success: true, ja_solicitado: true, status: 'estorno_solicitado', pagamento_id: pagamento.id, charge_id: pagamento.efi_charge_id, mensagem: 'O estorno deste pagamento já foi enviado à Efí.' });
       }
 
-      const dataPagamentoTexto =
-        pagamento.data_pagamento ||
-        pagamento.created_at;
-
-      const dataPagamento =
-        dataPagamentoTexto
-          ? new Date(dataPagamentoTexto)
-          : null;
-
-      if (
-        !dataPagamento ||
-        Number.isNaN(dataPagamento.getTime())
-      ) {
-        return res.status(409).json({
-          success: false,
-          error:
-            'A data do pagamento não está disponível ou é inválida.',
-        });
+      const dataPagamentoTexto = pagamento.data_pagamento || pagamento.created_at;
+      const dataPagamento = dataPagamentoTexto ? new Date(dataPagamentoTexto) : null;
+      if (!dataPagamento || Number.isNaN(dataPagamento.getTime())) {
+        return res.status(409).json({ success: false, error: 'A data do pagamento não está disponível ou é inválida.' });
       }
 
       const agora = new Date();
-
-      const limiteEstorno =
-        new Date(
-          dataPagamento.getTime() +
-          7 * 24 * 60 * 60 * 1000
-        );
-
+      const limiteEstorno = new Date(dataPagamento.getTime() + 7 * 24 * 60 * 60 * 1000);
       if (agora > limiteEstorno) {
-        return res.status(409).json({
-          success: false,
-          prazo_expirado: true,
-          error:
-            'O prazo de 7 dias para solicitar o cancelamento deste pagamento já expirou.',
-          data_pagamento:
-            dataPagamento.toISOString(),
-          limite_cancelamento:
-            limiteEstorno.toISOString(),
-        });
+        return res.status(409).json({ success: false, prazo_expirado: true, error: 'O prazo de 7 dias para solicitar o cancelamento deste pagamento já expirou.', data_pagamento: dataPagamento.toISOString(), limite_cancelamento: limiteEstorno.toISOString() });
       }
 
-      const chargeId =
-        String(pagamento.efi_charge_id || '').trim();
-
+      const chargeId = String(pagamento.efi_charge_id || '').trim();
+      console.log('>>> Charge ID:', chargeId || 'ausente');
       if (!chargeId) {
-        return res.status(409).json({
-          success: false,
-          error:
-            'O pagamento não possui efi_charge_id para solicitar o estorno.',
-        });
+        return res.status(409).json({ success: false, error: 'O pagamento não possui efi_charge_id para solicitar o estorno.' });
       }
 
-      const accessToken =
-        await obterTokenCobranca();
-
-      const consultaCharge =
-        await axios({
-          method: 'GET',
-          url:
-            `${EFI_COBRANCA_API_URL}/charge/${encodeURIComponent(
-              chargeId
-            )}`,
-          headers: {
-            Authorization:
-              `Bearer ${accessToken}`,
-            'Content-Type':
-              'application/json',
-          },
-          httpsAgent,
-          timeout: 30000,
-        });
-
-      const statusEfi =
-        String(
-          consultaCharge.data?.data?.status || ''
-        )
-          .trim()
-          .toLowerCase();
-
-      console.log(
-        `>>> Estorno cartão avulso. Pagamento ${pagamentoId}. Charge ${chargeId}. Status Efí: ${statusEfi}.`
-      );
+      const accessToken = await obterTokenCobranca();
+      const consultaCharge = await axios({
+        method: 'GET',
+        url: `${EFI_COBRANCA_API_URL}/charge/${encodeURIComponent(chargeId)}`,
+        headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+        httpsAgent,
+        timeout: 30000,
+      });
+      const statusEfi = String(consultaCharge.data?.data?.status || '').trim().toLowerCase();
+      console.log('>>> Status atual Efí:', statusEfi || 'desconhecido');
 
       if (statusEfi === 'refunded') {
-        const atualizado =
-          await atualizarPagamentoAvulsoPorId(
-            pagamento.id,
-            {
-              status: 'estornado',
-              estorno_concluido_em:
-                new Date().toISOString(),
-              motivo_cancelamento:
-                motivoCancelamento,
-            }
-          );
+        const atualizado = await atualizarPagamentoAvulsoPorId(pagamento.id, {
+          status: 'estornado', estorno_concluido_em: new Date().toISOString(), motivo_cancelamento: motivoCancelamento,
+        });
+        return res.json({ success: true, ja_estornado: true, status: 'estornado', pagamento: atualizado });
+      }
 
-        return res.json({
+      // Se ainda estiver approved, registra a intenção. O webhook tentará o refund
+      // automaticamente quando a Efí informar que a cobrança chegou a paid.
+      if (statusEfi === 'approved') {
+        const atualizado = await atualizarPagamentoAvulsoPorId(pagamento.id, {
+          status: 'estorno_pendente',
+          estorno_solicitado_em: pagamento.estorno_solicitado_em || new Date().toISOString(),
+          motivo_cancelamento: motivoCancelamento,
+        });
+        console.log('>>> Estorno registrado como pendente; aguardando status paid na Efí.');
+        return res.status(202).json({
           success: true,
-          ja_estornado: true,
-          status: 'estornado',
+          aguardando_estorno: true,
+          status: 'estorno_pendente',
+          status_efi: statusEfi,
+          mensagem: 'Cancelamento registrado. A cobrança ainda está aprovada e o estorno será enviado automaticamente quando a Efí liberar o status paid.',
+          pagamento_id: pagamento.id,
+          charge_id: chargeId,
+          data_pagamento: dataPagamento.toISOString(),
+          limite_cancelamento: limiteEstorno.toISOString(),
           pagamento: atualizado,
         });
       }
 
       if (statusEfi !== 'paid') {
-        return res.status(409).json({
-          success: false,
-          error:
-            `A cobrança ainda não está disponível para estorno. Status atual na Efí: ${statusEfi || 'desconhecido'}.`,
-          status_efi:
-            statusEfi || null,
-          charge_id:
-            chargeId,
-        });
+        return res.status(409).json({ success: false, error: `A cobrança não está em um status que permita registrar/enviar o estorno. Status atual na Efí: ${statusEfi || 'desconhecido'}.`, status_efi: statusEfi || null, charge_id: chargeId });
       }
 
-      const respostaEstorno =
-        await axios({
-          method: 'POST',
-          url:
-            `${EFI_COBRANCA_API_URL}/charge/card/${encodeURIComponent(
-              chargeId
-            )}/refund`,
-          headers: {
-            Authorization:
-              `Bearer ${accessToken}`,
-            'Content-Type':
-              'application/json',
-          },
-          data: {},
-          httpsAgent,
-          timeout: 30000,
-        });
-
-      const pagamentoAtualizado =
-        await atualizarPagamentoAvulsoPorId(
-          pagamento.id,
-          {
-            status: 'estorno_solicitado',
-            estorno_solicitado_em:
-              new Date().toISOString(),
-            motivo_cancelamento:
-              motivoCancelamento,
-          }
-        );
-
-      return res.json({
-        success: true,
+      const respostaEstorno = await solicitarEstornoCartaoEfi(accessToken, chargeId);
+      const pagamentoAtualizado = await atualizarPagamentoAvulsoPorId(pagamento.id, {
         status: 'estorno_solicitado',
-        mensagem:
-          'Solicitação de estorno enviada à Efí. O reembolso está em processamento.',
-        pagamento_id:
-          pagamento.id,
-        charge_id:
-          chargeId,
-        data_pagamento:
-          dataPagamento.toISOString(),
-        limite_cancelamento:
-          limiteEstorno.toISOString(),
-        pagamento:
-          pagamentoAtualizado,
-        efi:
-          respostaEstorno.data,
+        estorno_solicitado_em: pagamento.estorno_solicitado_em || new Date().toISOString(),
+        motivo_cancelamento: motivoCancelamento,
       });
+      console.log('>>> Refund enviado à Efí com sucesso.');
 
+      return res.json({ success: true, status: 'estorno_solicitado', mensagem: 'Solicitação de estorno enviada à Efí. O reembolso está em processamento.', pagamento_id: pagamento.id, charge_id: chargeId, data_pagamento: dataPagamento.toISOString(), limite_cancelamento: limiteEstorno.toISOString(), pagamento: pagamentoAtualizado, efi: respostaEstorno.data });
     } catch (error) {
-      console.error(
-        '>>> ERRO AO ESTORNAR PAGAMENTO AVULSO NO CARTÃO:',
-        error.response?.data ||
-        error.message
-      );
-
-      const respostaEfi =
-        error.response?.data;
-
-      let mensagem =
-        respostaEfi?.error_description ||
-        respostaEfi?.mensagem ||
-        respostaEfi?.message ||
-        respostaEfi?.error ||
-        error.message;
-
-      if (typeof mensagem !== 'string') {
-        mensagem =
-          JSON.stringify(mensagem);
-      }
-
-      return res
-        .status(error.response?.status || 500)
-        .json({
-          success: false,
-          error: mensagem,
-          efi:
-            respostaEfi ||
-            null,
-        });
+      console.error('>>> ERRO AO ESTORNAR PAGAMENTO AVULSO NO CARTÃO:', error.response?.data || error.message);
+      const respostaEfi = error.response?.data;
+      let mensagem = respostaEfi?.error_description || respostaEfi?.mensagem || respostaEfi?.message || respostaEfi?.error || error.message;
+      if (typeof mensagem !== 'string') mensagem = JSON.stringify(mensagem);
+      return res.status(error.response?.status || 500).json({ success: false, error: mensagem, efi: respostaEfi || null });
     }
   }
 );
-
 
 // ============================================================
 // 5. CANCELAMENTO DA ASSINATURA PELO USUÁRIO
@@ -3884,6 +3850,33 @@ app.get(
   }
 );
  
+
+// ============================================================
+// PROCESSAMENTO AUTOMÁTICO DE ESTORNOS PENDENTES
+// ============================================================
+async function processarEstornosPendentes() {
+  try {
+    const { supabaseUrl } = obterConfiguracaoSupabase();
+    const response = await axios({
+      method: 'GET',
+      url: `${supabaseUrl}/rest/v1/tab_pagamentos_avulsos`,
+      params: { select: 'id,efi_charge_id,status', tipo_pagamento: 'eq.cartao', status: 'eq.estorno_pendente', limit: 100 },
+      headers: obterHeadersSupabase(),
+      timeout: 30000,
+    });
+    const pendentes = Array.isArray(response.data) ? response.data : [];
+    for (const pagamento of pendentes) {
+      if (!pagamento.efi_charge_id) continue;
+      try { await processarEstornoPendentePorChargeId(String(pagamento.efi_charge_id)); }
+      catch (error) { console.error(`>>> Falha ao reprocessar estorno pendente ${pagamento.id}:`, error.response?.data || error.message); }
+    }
+    return pendentes.length;
+  } catch (error) {
+    console.error('>>> Erro ao buscar/processar estornos pendentes:', error.response?.data || error.message);
+    return 0;
+  }
+}
+
 // ============================================================
 // INICIAR SERVIDOR
 // ============================================================
@@ -3937,3 +3930,8 @@ setInterval(
   },
   60 * 60 * 1000
 );
+
+
+// Reprocessa estornos pendentes 15s após subir e depois a cada 5 minutos.
+setTimeout(() => { processarEstornosPendentes(); }, 15000);
+setInterval(() => { processarEstornosPendentes(); }, 5 * 60 * 1000);

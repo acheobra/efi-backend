@@ -83,11 +83,14 @@ try {
 // PIX - HOMOLOGAÇÃO
 // ------------------------------------------------------------
  
+const EFI_PIX_BASE_URL =
+  'https://pix-h.api.efipay.com.br';
+
 const EFI_PIX_AUTH_URL =
-  'https://pix-h.api.efipay.com.br/oauth/token';
- 
+  `${EFI_PIX_BASE_URL}/oauth/token`;
+
 const EFI_PIX_COB_URL =
-  'https://pix-h.api.efipay.com.br/v2/cob';
+  `${EFI_PIX_BASE_URL}/v2/cob`;
  
 // ------------------------------------------------------------
 // COBRANÇAS - HOMOLOGAÇÃO
@@ -423,6 +426,334 @@ async function atualizarPagamentoAvulsoPorId(
   return Array.isArray(response.data)
     ? response.data[0] || null
     : null;
+}
+
+
+// ============================================================
+// SUPABASE / EFÍ - PAGAMENTOS AVULSOS PIX
+// ============================================================
+
+async function buscarPagamentoAvulsoPixPorIdUsuario(pagamentoId, usuarioId) {
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+
+  const response = await axios({
+    method: 'GET',
+    url: `${supabaseUrl}/rest/v1/tab_pagamentos_avulsos`,
+    params: {
+      select: '*',
+      id: `eq.${pagamentoId}`,
+      usuario_id: `eq.${usuarioId}`,
+      tipo_pagamento: 'eq.pix',
+      limit: 1,
+    },
+    headers: obterHeadersSupabase(),
+    timeout: 30000,
+  });
+
+  return Array.isArray(response.data)
+    ? response.data[0] || null
+    : null;
+}
+
+async function buscarPagamentoAvulsoPixPorTxid(txid, usuarioId = null) {
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+
+  const params = {
+    select: '*',
+    pix_txid: `eq.${txid}`,
+    tipo_pagamento: 'eq.pix',
+    limit: 1,
+  };
+
+  if (usuarioId) {
+    params.usuario_id = `eq.${usuarioId}`;
+  }
+
+  const response = await axios({
+    method: 'GET',
+    url: `${supabaseUrl}/rest/v1/tab_pagamentos_avulsos`,
+    params,
+    headers: obterHeadersSupabase(),
+    timeout: 30000,
+  });
+
+  return Array.isArray(response.data)
+    ? response.data[0] || null
+    : null;
+}
+
+async function consultarCobrancaPixEfi(accessToken, txid) {
+  const response = await axios({
+    method: 'GET',
+    url: `${EFI_PIX_COB_URL}/${encodeURIComponent(txid)}`,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    httpsAgent,
+    timeout: 30000,
+  });
+
+  return response.data || null;
+}
+
+function extrairPixRecebidoDaCobranca(cobranca) {
+  const pix = Array.isArray(cobranca?.pix)
+    ? cobranca.pix
+    : [];
+
+  return pix.length > 0
+    ? pix[pix.length - 1] || null
+    : null;
+}
+
+function gerarIdDevolucaoPix(pagamentoId) {
+  const id = String(pagamentoId || '')
+    .replace(/[^a-zA-Z0-9]/g, '')
+    .substring(0, 35);
+
+  return id || `acheobra${Date.now()}`.substring(0, 35);
+}
+
+async function solicitarDevolucaoPixEfi(
+  accessToken,
+  e2eId,
+  devolucaoId,
+  valor
+) {
+  return axios({
+    method: 'PUT',
+    url:
+      `${EFI_PIX_BASE_URL}/v2/pix/${encodeURIComponent(e2eId)}` +
+      `/devolucao/${encodeURIComponent(devolucaoId)}`,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    data: {
+      valor: Number(valor).toFixed(2),
+    },
+    httpsAgent,
+    timeout: 30000,
+  });
+}
+
+async function consultarDevolucaoPixEfi(
+  accessToken,
+  e2eId,
+  devolucaoId
+) {
+  return axios({
+    method: 'GET',
+    url:
+      `${EFI_PIX_BASE_URL}/v2/pix/${encodeURIComponent(e2eId)}` +
+      `/devolucao/${encodeURIComponent(devolucaoId)}`,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    httpsAgent,
+    timeout: 30000,
+  });
+}
+
+async function sincronizarPagamentoPixPorTxid(txid, usuarioId = null) {
+  const id = String(txid || '').trim();
+
+  if (!id) {
+    return {
+      encontrado: false,
+      pago: false,
+      motivo: 'txid_ausente',
+    };
+  }
+
+  const pagamento =
+    await buscarPagamentoAvulsoPixPorTxid(
+      id,
+      usuarioId
+    );
+
+  const accessToken =
+    await obterTokenPix();
+
+  const cobranca =
+    await consultarCobrancaPixEfi(
+      accessToken,
+      id
+    );
+
+  const statusEfi =
+    String(cobranca?.status || '')
+      .trim()
+      .toUpperCase();
+
+  const pixRecebido =
+    extrairPixRecebidoDaCobranca(
+      cobranca
+    );
+
+  const e2eId =
+    pixRecebido?.endToEndId
+      ? String(pixRecebido.endToEndId).trim()
+      : '';
+
+  const pago =
+    statusEfi === 'CONCLUIDA' &&
+    Boolean(e2eId);
+
+  let pagamentoAtualizado =
+    pagamento;
+
+  if (pagamento) {
+    const atualizacao = {
+      status:
+        pago
+          ? 'pago'
+          : (
+              String(pagamento.status || '')
+                .trim()
+                .toLowerCase() === 'pago'
+                ? 'pago'
+                : 'aguardando_pagamento'
+            ),
+    };
+
+    if (e2eId) {
+      atualizacao.pix_e2e_id =
+        e2eId;
+    }
+
+    if (pago) {
+      atualizacao.data_pagamento =
+        pixRecebido?.horario ||
+        pagamento.data_pagamento ||
+        new Date().toISOString();
+    }
+
+    pagamentoAtualizado =
+      await atualizarPagamentoAvulsoPorId(
+        pagamento.id,
+        atualizacao
+      );
+  }
+
+  return {
+    encontrado: Boolean(pagamento),
+    pago,
+    status_efi: statusEfi || null,
+    txid: id,
+    e2e_id: e2eId || null,
+    pix: pixRecebido,
+    pagamento: pagamentoAtualizado,
+    cobranca,
+  };
+}
+
+async function processarDevolucaoPixPendente(pagamento) {
+  if (!pagamento?.id) {
+    return {
+      processado: false,
+      motivo: 'pagamento_ausente',
+    };
+  }
+
+  let e2eId =
+    String(
+      pagamento.pix_e2e_id ||
+      ''
+    ).trim();
+
+  const txid =
+    String(
+      pagamento.pix_txid ||
+      ''
+    ).trim();
+
+  if (!e2eId && txid) {
+    const sincronizacao =
+      await sincronizarPagamentoPixPorTxid(
+        txid,
+        pagamento.usuario_id
+      );
+
+    e2eId =
+      String(
+        sincronizacao.e2e_id ||
+        ''
+      ).trim();
+  }
+
+  if (!e2eId) {
+    return {
+      processado: false,
+      aguardando_e2e_id: true,
+    };
+  }
+
+  const devolucaoId =
+    gerarIdDevolucaoPix(
+      pagamento.id
+    );
+
+  const accessToken =
+    await obterTokenPix();
+
+  const consulta =
+    await consultarDevolucaoPixEfi(
+      accessToken,
+      e2eId,
+      devolucaoId
+    );
+
+  const statusDevolucao =
+    String(
+      consulta.data?.status ||
+      ''
+    )
+      .trim()
+      .toUpperCase();
+
+  if (statusDevolucao === 'DEVOLVIDO') {
+    const atualizado =
+      await atualizarPagamentoAvulsoPorId(
+        pagamento.id,
+        {
+          status: 'estornado',
+          estorno_concluido_em: new Date().toISOString(),
+        }
+      );
+
+    return {
+      processado: true,
+      status: 'estornado',
+      efi: consulta.data,
+      pagamento: atualizado,
+    };
+  }
+
+  if (statusDevolucao === 'NAO_REALIZADO') {
+    const atualizado =
+      await atualizarPagamentoAvulsoPorId(
+        pagamento.id,
+        {
+          status: 'estorno_falhou',
+        }
+      );
+
+    return {
+      processado: true,
+      status: 'estorno_falhou',
+      efi: consulta.data,
+      pagamento: atualizado,
+    };
+  }
+
+  return {
+    processado: true,
+    status: 'estorno_solicitado',
+    efi: consulta.data,
+  };
 }
 
 
@@ -1758,6 +2089,9 @@ app.post(
         cpf,
         nome,
         descricao,
+        usuario_id,
+        origem_tipo,
+        origem_id,
       } = req.body;
  
       if (!valor || !cpf) {
@@ -1883,15 +2217,58 @@ app.post(
             .pix_copia_e_cola;
       }
  
+      let pagamentoAvulsoSalvo = null;
+      let erroRegistroPagamentoAvulso = null;
+
+      if (usuario_id && txid) {
+        try {
+          const valorNumerico = Number(valor);
+
+          pagamentoAvulsoSalvo =
+            await inserirPagamentoAvulsoSupabase({
+              usuario_id: String(usuario_id),
+              origem_tipo: origem_tipo ? String(origem_tipo) : null,
+              origem_id: normalizarUuidOuNull(origem_id),
+              tipo_pagamento: 'pix',
+              valor: Number.isFinite(valorNumerico) ? valorNumerico : 0,
+              efi_charge_id: null,
+              pix_txid: String(txid),
+              pix_e2e_id: null,
+              status: 'aguardando_pagamento',
+              data_pagamento: null,
+              estorno_solicitado_em: null,
+              estorno_concluido_em: null,
+              motivo_cancelamento: null,
+            });
+
+          console.log(
+            '>>> Cobrança Pix registrada em tab_pagamentos_avulsos:',
+            pagamentoAvulsoSalvo?.id || 'ID não retornado',
+            '| txid:',
+            txid
+          );
+        } catch (erroRegistroPagamento) {
+          erroRegistroPagamentoAvulso =
+            erroRegistroPagamento.response?.data ||
+            erroRegistroPagamento.message;
+
+          console.error(
+            '>>> Pix gerado, mas falhou ao registrar em tab_pagamentos_avulsos:',
+            erroRegistroPagamentoAvulso
+          );
+        }
+      }
+
       return res.json({
-        success:
-          true,
- 
-        txid:
-          txid,
- 
-        pix_copia_e_cola:
-          copiaECola,
+        success: true,
+        txid: txid,
+        pix_copia_e_cola: copiaECola,
+        pagamento_avulso_id:
+          pagamentoAvulsoSalvo?.id || null,
+        registro_pagamento_salvo:
+          pagamentoAvulsoSalvo != null,
+        erro_registro_pagamento:
+          erroRegistroPagamentoAvulso,
       });
  
     } catch (error) {
@@ -1925,6 +2302,88 @@ app.post(
   }
 );
  
+// ============================================================
+// 1.1 CONSULTAR / CONFIRMAR PAGAMENTO PIX
+// ============================================================
+
+app.get(
+  '/status-pix/:txid',
+
+  async (req, res) => {
+    try {
+      const usuario =
+        await obterUsuarioSupabaseDoBearer(req);
+
+      if (!usuario?.id) {
+        return res.status(401).json({
+          success: false,
+          error: 'Usuário não autenticado.',
+        });
+      }
+
+      const txid =
+        String(req.params?.txid || '').trim();
+
+      if (!txid) {
+        return res.status(400).json({
+          success: false,
+          error: 'txid é obrigatório.',
+        });
+      }
+
+      const pagamento =
+        await buscarPagamentoAvulsoPixPorTxid(
+          txid,
+          usuario.id
+        );
+
+      if (!pagamento) {
+        return res.status(404).json({
+          success: false,
+          error:
+            'Pagamento Pix não encontrado para este usuário.',
+        });
+      }
+
+      const resultado =
+        await sincronizarPagamentoPixPorTxid(
+          txid,
+          usuario.id
+        );
+
+      return res.json({
+        success: true,
+        pago: resultado.pago,
+        status:
+          resultado.pago
+            ? 'pago'
+            : 'aguardando_pagamento',
+        status_efi: resultado.status_efi,
+        txid: resultado.txid,
+        e2e_id: resultado.e2e_id,
+        pagamento: resultado.pagamento,
+      });
+
+    } catch (error) {
+      console.error(
+        '>>> ERRO AO CONSULTAR STATUS PIX:',
+        error.response?.data ||
+        error.message
+      );
+
+      return res
+        .status(error.response?.status || 500)
+        .json({
+          success: false,
+          error:
+            error.response?.data ||
+            error.message,
+        });
+    }
+  }
+);
+
+
 // ============================================================
 // 2. COBRANÇA AVULSA COM CARTÃO
 // ============================================================
@@ -3212,6 +3671,413 @@ app.post(
 );
  
 // ============================================================
+// 4.1 DEVOLUÇÃO DE PAGAMENTO AVULSO PIX EM ATÉ 7 DIAS
+// ============================================================
+
+app.post(
+  '/cancelar-pagamento-pix',
+
+  async (req, res) => {
+    console.log('==========================================');
+    console.log('>>> SOLICITAÇÃO DE CANCELAMENTO PIX AVULSO');
+    console.log('>>> Body:', req.body);
+    console.log('==========================================');
+
+    try {
+      const usuario =
+        await obterUsuarioSupabaseDoBearer(req);
+
+      if (!usuario?.id) {
+        return res.status(401).json({
+          success: false,
+          error: 'Usuário não autenticado.',
+        });
+      }
+
+      const pagamentoId =
+        String(req.body?.pagamento_id || '').trim();
+
+      const motivoCancelamento =
+        String(
+          req.body?.motivo_cancelamento ||
+          'Cancelamento Pix solicitado pelo usuário dentro do prazo de 7 dias.'
+        ).trim().substring(0, 1000);
+
+      if (!pagamentoId) {
+        return res.status(400).json({
+          success: false,
+          error: 'pagamento_id é obrigatório.',
+        });
+      }
+
+      let pagamento =
+        await buscarPagamentoAvulsoPixPorIdUsuario(
+          pagamentoId,
+          usuario.id
+        );
+
+      console.log(
+        '>>> Pagamento Pix localizado:',
+        pagamento?.id || 'não encontrado'
+      );
+
+      if (!pagamento) {
+        return res.status(404).json({
+          success: false,
+          error:
+            'Pagamento avulso Pix não encontrado para este usuário.',
+        });
+      }
+
+      let statusLocal =
+        String(pagamento.status || '')
+          .trim()
+          .toLowerCase();
+
+      if (
+        statusLocal === 'estornado' ||
+        statusLocal === 'refunded'
+      ) {
+        return res.json({
+          success: true,
+          ja_estornado: true,
+          status: 'estornado',
+          pagamento_id: pagamento.id,
+          txid: pagamento.pix_txid,
+          e2e_id: pagamento.pix_e2e_id,
+        });
+      }
+
+      if (
+        !pagamento.pix_e2e_id ||
+        statusLocal === 'aguardando_pagamento'
+      ) {
+        const sincronizacao =
+          await sincronizarPagamentoPixPorTxid(
+            pagamento.pix_txid,
+            usuario.id
+          );
+
+        pagamento =
+          sincronizacao.pagamento ||
+          pagamento;
+
+        statusLocal =
+          String(pagamento.status || '')
+            .trim()
+            .toLowerCase();
+
+        if (!sincronizacao.pago) {
+          return res.status(409).json({
+            success: false,
+            error:
+              'O Pix ainda não está confirmado pela Efí.',
+            status_efi:
+              sincronizacao.status_efi,
+            txid:
+              pagamento.pix_txid,
+          });
+        }
+      }
+
+      const dataPagamentoTexto =
+        pagamento.data_pagamento ||
+        pagamento.created_at;
+
+      const dataPagamento =
+        dataPagamentoTexto
+          ? new Date(dataPagamentoTexto)
+          : null;
+
+      if (
+        !dataPagamento ||
+        Number.isNaN(dataPagamento.getTime())
+      ) {
+        return res.status(409).json({
+          success: false,
+          error:
+            'A data do pagamento Pix não está disponível ou é inválida.',
+        });
+      }
+
+      const limiteCancelamento =
+        new Date(
+          dataPagamento.getTime() +
+          7 * 24 * 60 * 60 * 1000
+        );
+
+      if (Date.now() > limiteCancelamento.getTime()) {
+        return res.status(409).json({
+          success: false,
+          prazo_expirado: true,
+          error:
+            'O prazo de 7 dias para solicitar a devolução deste Pix já expirou.',
+          data_pagamento:
+            dataPagamento.toISOString(),
+          limite_cancelamento:
+            limiteCancelamento.toISOString(),
+        });
+      }
+
+      const e2eId =
+        String(pagamento.pix_e2e_id || '').trim();
+
+      const txid =
+        String(pagamento.pix_txid || '').trim();
+
+      if (!e2eId) {
+        return res.status(409).json({
+          success: false,
+          error:
+            'O pagamento Pix não possui e2eId para solicitar a devolução.',
+          txid,
+        });
+      }
+
+      const valor =
+        Number(pagamento.valor);
+
+      if (
+        !Number.isFinite(valor) ||
+        valor <= 0
+      ) {
+        return res.status(409).json({
+          success: false,
+          error:
+            'O valor do pagamento Pix é inválido para devolução.',
+        });
+      }
+
+      const devolucaoId =
+        gerarIdDevolucaoPix(
+          pagamento.id
+        );
+
+      const accessToken =
+        await obterTokenPix();
+
+      if (statusLocal === 'estorno_solicitado') {
+        try {
+          const consulta =
+            await consultarDevolucaoPixEfi(
+              accessToken,
+              e2eId,
+              devolucaoId
+            );
+
+          const statusDevolucao =
+            String(
+              consulta.data?.status || ''
+            )
+              .trim()
+              .toUpperCase();
+
+          if (statusDevolucao === 'DEVOLVIDO') {
+            const atualizado =
+              await atualizarPagamentoAvulsoPorId(
+                pagamento.id,
+                {
+                  status: 'estornado',
+                  estorno_concluido_em:
+                    new Date().toISOString(),
+                }
+              );
+
+            return res.json({
+              success: true,
+              ja_estornado: true,
+              status: 'estornado',
+              pagamento: atualizado,
+              efi: consulta.data,
+            });
+          }
+
+          return res.json({
+            success: true,
+            ja_solicitado: true,
+            status: 'estorno_solicitado',
+            mensagem:
+              'A devolução Pix já foi solicitada e ainda está em processamento.',
+            pagamento_id: pagamento.id,
+            txid,
+            e2e_id: e2eId,
+            efi: consulta.data,
+          });
+
+        } catch (consultaError) {
+          console.warn(
+            '>>> Não foi possível consultar devolução Pix já solicitada:',
+            consultaError.response?.data ||
+            consultaError.message
+          );
+        }
+      }
+
+      let respostaDevolucao;
+
+      try {
+        respostaDevolucao =
+          await solicitarDevolucaoPixEfi(
+            accessToken,
+            e2eId,
+            devolucaoId,
+            valor
+          );
+      } catch (devolucaoError) {
+        const nomeErro =
+          devolucaoError.response?.data?.nome;
+
+        if (
+          devolucaoError.response?.status === 409 ||
+          nomeErro === 'devolucao_id_duplicado'
+        ) {
+          respostaDevolucao =
+            await consultarDevolucaoPixEfi(
+              accessToken,
+              e2eId,
+              devolucaoId
+            );
+        } else {
+          throw devolucaoError;
+        }
+      }
+
+      const statusDevolucao =
+        String(
+          respostaDevolucao.data?.status || ''
+        )
+          .trim()
+          .toUpperCase();
+
+      const agoraIso =
+        new Date().toISOString();
+
+      if (statusDevolucao === 'DEVOLVIDO') {
+        const atualizado =
+          await atualizarPagamentoAvulsoPorId(
+            pagamento.id,
+            {
+              status: 'estornado',
+              estorno_solicitado_em:
+                pagamento.estorno_solicitado_em ||
+                agoraIso,
+              estorno_concluido_em:
+                agoraIso,
+              motivo_cancelamento:
+                motivoCancelamento,
+            }
+          );
+
+        return res.json({
+          success: true,
+          status: 'estornado',
+          pagamento_id: pagamento.id,
+          txid,
+          e2e_id: e2eId,
+          pagamento: atualizado,
+          efi: respostaDevolucao.data,
+        });
+      }
+
+      if (statusDevolucao === 'NAO_REALIZADO') {
+        const atualizado =
+          await atualizarPagamentoAvulsoPorId(
+            pagamento.id,
+            {
+              status: 'estorno_falhou',
+              estorno_solicitado_em:
+                pagamento.estorno_solicitado_em ||
+                agoraIso,
+              motivo_cancelamento:
+                motivoCancelamento,
+            }
+          );
+
+        return res.status(409).json({
+          success: false,
+          status: 'estorno_falhou',
+          error:
+            respostaDevolucao.data?.motivo ||
+            'A Efí não realizou a devolução Pix.',
+          pagamento: atualizado,
+          efi: respostaDevolucao.data,
+        });
+      }
+
+      const atualizado =
+        await atualizarPagamentoAvulsoPorId(
+          pagamento.id,
+          {
+            status: 'estorno_solicitado',
+            estorno_solicitado_em:
+              pagamento.estorno_solicitado_em ||
+              agoraIso,
+            motivo_cancelamento:
+              motivoCancelamento,
+          }
+        );
+
+      console.log(
+        '>>> Devolução Pix solicitada com sucesso.',
+        '| pagamento:',
+        pagamento.id,
+        '| txid:',
+        txid,
+        '| e2eId:',
+        e2eId,
+        '| status:',
+        statusDevolucao || 'não informado'
+      );
+
+      return res.json({
+        success: true,
+        status: 'estorno_solicitado',
+        mensagem:
+          'Solicitação de devolução Pix enviada à Efí. A devolução está em processamento.',
+        pagamento_id: pagamento.id,
+        txid,
+        e2e_id: e2eId,
+        devolucao_id: devolucaoId,
+        pagamento: atualizado,
+        efi: respostaDevolucao.data,
+      });
+
+    } catch (error) {
+      console.error(
+        '>>> ERRO AO DEVOLVER PAGAMENTO PIX:',
+        error.response?.data ||
+        error.message
+      );
+
+      const respostaEfi =
+        error.response?.data;
+
+      let mensagem =
+        respostaEfi?.mensagem ||
+        respostaEfi?.message ||
+        respostaEfi?.error ||
+        respostaEfi?.nome ||
+        error.message;
+
+      if (typeof mensagem !== 'string') {
+        mensagem = JSON.stringify(mensagem);
+      }
+
+      return res
+        .status(error.response?.status || 500)
+        .json({
+          success: false,
+          error: mensagem,
+          efi:
+            respostaEfi ||
+            null,
+        });
+    }
+  }
+);
+
+
+// ============================================================
 // 5. ESTORNO DE PAGAMENTO AVULSO NO CARTÃO
 // ============================================================
 
@@ -3821,6 +4687,12 @@ app.get(
       rotas: {
         pix:
           '/gerar-pix',
+
+        status_pix:
+          '/status-pix/:txid',
+
+        cancelar_pagamento_pix:
+          '/cancelar-pagamento-pix',
  
         cartao:
           '/cobrar-cartao',
@@ -3876,6 +4748,73 @@ async function processarEstornosPendentes() {
     return 0;
   }
 }
+
+// ============================================================
+// PROCESSAMENTO AUTOMÁTICO DE DEVOLUÇÕES PIX PENDENTES
+// ============================================================
+
+async function processarDevolucoesPixPendentes() {
+  try {
+    const { supabaseUrl } =
+      obterConfiguracaoSupabase();
+
+    const response =
+      await axios({
+        method: 'GET',
+        url:
+          `${supabaseUrl}/rest/v1/tab_pagamentos_avulsos`,
+        params: {
+          select: '*',
+          tipo_pagamento: 'eq.pix',
+          status: 'eq.estorno_solicitado',
+          limit: 100,
+        },
+        headers:
+          obterHeadersSupabase(),
+        timeout: 30000,
+      });
+
+    const pendentes =
+      Array.isArray(response.data)
+        ? response.data
+        : [];
+
+    for (const pagamento of pendentes) {
+      try {
+        const resultado =
+          await processarDevolucaoPixPendente(
+            pagamento
+          );
+
+        console.log(
+          '>>> Reprocessamento devolução Pix:',
+          pagamento.id,
+          resultado?.status ||
+          resultado?.motivo ||
+          'sem alteração'
+        );
+      } catch (error) {
+        console.error(
+          `>>> Falha ao reprocessar devolução Pix ${pagamento.id}:`,
+          error.response?.data ||
+          error.message
+        );
+      }
+    }
+
+    return pendentes.length;
+
+  } catch (error) {
+    console.error(
+      '>>> Erro ao buscar/processar devoluções Pix pendentes:',
+      error.response?.data ||
+      error.message
+    );
+
+    return 0;
+  }
+}
+
 
 // ============================================================
 // INICIAR SERVIDOR
@@ -3935,3 +4874,8 @@ setInterval(
 // Reprocessa estornos pendentes 15s após subir e depois a cada 5 minutos.
 setTimeout(() => { processarEstornosPendentes(); }, 15000);
 setInterval(() => { processarEstornosPendentes(); }, 5 * 60 * 1000);
+
+
+// Reprocessa devoluções Pix pendentes 20s após subir e depois a cada 5 minutos.
+setTimeout(() => { processarDevolucoesPixPendentes(); }, 20000);
+setInterval(() => { processarDevolucoesPixPendentes(); }, 5 * 60 * 1000);

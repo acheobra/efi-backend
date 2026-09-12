@@ -344,6 +344,129 @@ function obterHeadersSupabase() {
       'application/json',
   };
 }
+
+
+// ============================================================
+// SUPABASE - REQUISIÇÃO INTERNA COM RETRY DE JWT/CLOCK SKEW
+// ============================================================
+//
+// Em algumas execuções agendadas o PostgREST pode responder:
+//
+//   PGRST303
+//   JWT issued at future
+//
+// Isso normalmente é transitório e pode ocorrer por pequena
+// diferença de relógio entre serviços/instâncias.
+//
+// IMPORTANTE:
+// - Não troca a SUPABASE_SERVICE_ROLE_KEY.
+// - Não reutiliza token de usuário.
+// - Recria os headers internos a cada tentativa.
+// - Só repete automaticamente para esse erro específico.
+// - Outros erros continuam sendo lançados normalmente.
+// ============================================================
+
+function aguardar(ms) {
+  return new Promise(
+    (resolve) => setTimeout(resolve, ms)
+  );
+}
+
+function erroSupabaseJwtEmitidoNoFuturo(error) {
+  const dados =
+    error?.response?.data || {};
+
+  const codigo =
+    String(
+      dados?.code || ''
+    )
+      .trim()
+      .toUpperCase();
+
+  const mensagem =
+    String(
+      dados?.message ||
+      dados?.msg ||
+      error?.message ||
+      ''
+    )
+      .trim()
+      .toLowerCase();
+
+  return (
+    codigo === 'PGRST303' &&
+    mensagem.includes(
+      'jwt issued at future'
+    )
+  );
+}
+
+async function requisicaoSupabaseInterna(
+  configuracaoAxios,
+  {
+    maxTentativas = 4,
+    atrasoInicialMs = 1500,
+  } = {}
+) {
+  let ultimoErro = null;
+
+  for (
+    let tentativa = 1;
+    tentativa <= maxTentativas;
+    tentativa++
+  ) {
+    try {
+      const headersExtras =
+        configuracaoAxios?.headers || {};
+
+      return await axios({
+        ...configuracaoAxios,
+
+        headers: {
+          ...obterHeadersSupabase(),
+          ...headersExtras,
+        },
+      });
+
+    } catch (error) {
+      ultimoErro = error;
+
+      if (
+        !erroSupabaseJwtEmitidoNoFuturo(
+          error
+        )
+      ) {
+        throw error;
+      }
+
+      if (
+        tentativa >= maxTentativas
+      ) {
+        break;
+      }
+
+      const esperaMs =
+        atrasoInicialMs * tentativa;
+
+      console.warn(
+        '>>> Supabase retornou PGRST303 / JWT issued at future. '
+        + `Nova tentativa ${tentativa + 1}/${maxTentativas} `
+        + `em ${esperaMs} ms.`
+      );
+
+      await aguardar(
+        esperaMs
+      );
+    }
+  }
+
+  console.error(
+    '>>> Supabase continuou retornando PGRST303 / JWT issued at future '
+    + `após ${maxTentativas} tentativa(s).`
+  );
+
+  throw ultimoErro;
+}
  
  
 // ============================================================
@@ -986,7 +1109,8 @@ async function atualizarAssinaturaPorSubscriptionId(
     supabaseUrl,
   } = obterConfiguracaoSupabase();
  
-  const response = await axios({
+  const response =
+      await requisicaoSupabaseInterna({
     method: 'PATCH',
  
     url:
@@ -996,9 +1120,7 @@ async function atualizarAssinaturaPorSubscriptionId(
       efi_subscription_id:
         `eq.${subscriptionId}`,
     },
- 
-    headers: {
-      ...obterHeadersSupabase(),
+        headers: {
  
       Prefer:
         'return=representation',
@@ -4726,16 +4848,37 @@ app.get(
 // ============================================================
 // PROCESSAMENTO AUTOMÁTICO DE ESTORNOS PENDENTES
 // ============================================================
+let processandoEstornosPendentes =
+  false;
+
 async function processarEstornosPendentes() {
+  if (
+    processandoEstornosPendentes
+  ) {
+    console.log(
+      '>>> Verificação de estornos de cartão já está em andamento. Ignorando execução simultânea.'
+    );
+
+    return 0;
+  }
+
+  processandoEstornosPendentes =
+    true;
+
   try {
     const { supabaseUrl } = obterConfiguracaoSupabase();
-    const response = await axios({
-      method: 'GET',
-      url: `${supabaseUrl}/rest/v1/tab_pagamentos_avulsos`,
-      params: { select: 'id,efi_charge_id,status', tipo_pagamento: 'eq.cartao', status: 'eq.estorno_pendente', limit: 100 },
-      headers: obterHeadersSupabase(),
-      timeout: 30000,
-    });
+    const response =
+      await requisicaoSupabaseInterna({
+        method: 'GET',
+        url: `${supabaseUrl}/rest/v1/tab_pagamentos_avulsos`,
+        params: {
+          select: 'id,efi_charge_id,status',
+          tipo_pagamento: 'eq.cartao',
+          status: 'eq.estorno_pendente',
+          limit: 100,
+        },
+        timeout: 30000,
+      });
     const pendentes = Array.isArray(response.data) ? response.data : [];
     for (const pagamento of pendentes) {
       if (!pagamento.efi_charge_id) continue;
@@ -4746,6 +4889,10 @@ async function processarEstornosPendentes() {
   } catch (error) {
     console.error('>>> Erro ao buscar/processar estornos pendentes:', error.response?.data || error.message);
     return 0;
+
+  } finally {
+    processandoEstornosPendentes =
+      false;
   }
 }
 
@@ -4753,13 +4900,29 @@ async function processarEstornosPendentes() {
 // PROCESSAMENTO AUTOMÁTICO DE DEVOLUÇÕES PIX PENDENTES
 // ============================================================
 
+let processandoDevolucoesPixPendentes =
+  false;
+
 async function processarDevolucoesPixPendentes() {
+  if (
+    processandoDevolucoesPixPendentes
+  ) {
+    console.log(
+      '>>> Verificação de devoluções Pix já está em andamento. Ignorando execução simultânea.'
+    );
+
+    return 0;
+  }
+
+  processandoDevolucoesPixPendentes =
+    true;
+
   try {
     const { supabaseUrl } =
       obterConfiguracaoSupabase();
 
     const response =
-      await axios({
+      await requisicaoSupabaseInterna({
         method: 'GET',
         url:
           `${supabaseUrl}/rest/v1/tab_pagamentos_avulsos`,
@@ -4769,8 +4932,6 @@ async function processarDevolucoesPixPendentes() {
           status: 'eq.estorno_solicitado',
           limit: 100,
         },
-        headers:
-          obterHeadersSupabase(),
         timeout: 30000,
       });
 
@@ -4812,6 +4973,10 @@ async function processarDevolucoesPixPendentes() {
     );
 
     return 0;
+
+  } finally {
+    processandoDevolucoesPixPendentes =
+      false;
   }
 }
 

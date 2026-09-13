@@ -1101,6 +1101,64 @@ async function buscarAssinaturaAtivaPorUsuario(
     : null;
 }
  
+
+// ============================================================
+// SUPABASE / EFÍ - AUXILIARES PARA TROCA DE PLANO RECORRENTE
+// ============================================================
+
+async function buscarPlanoRecorrentePorIdSupabase(planoId) {
+  const id = String(planoId || '').trim();
+
+  if (!id) {
+    return null;
+  }
+
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+
+  const response = await requisicaoSupabaseInterna({
+    method: 'GET',
+    url: `${supabaseUrl}/rest/v1/tab_planos`,
+    params: {
+      select:
+        'id,nome_plano,valor_recorrente,efi_plan_id,recorrencia_ativa,status,tipo_usuario',
+      id: `eq.${id}`,
+      limit: 1,
+    },
+    timeout: 30000,
+  });
+
+  return Array.isArray(response.data)
+    ? response.data[0] || null
+    : null;
+}
+
+async function cancelarAssinaturaEfiPorId(
+  accessToken,
+  subscriptionId
+) {
+  const id = String(subscriptionId || '').trim();
+
+  if (!id) {
+    throw new Error(
+      'efi_subscription_id não informado para cancelamento.'
+    );
+  }
+
+  return axios({
+    method: 'PUT',
+    url:
+      `${EFI_COBRANCA_API_URL}/subscription/${encodeURIComponent(
+        id
+      )}/cancel`,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    httpsAgent,
+    timeout: 30000,
+  });
+}
+
 async function atualizarAssinaturaPorSubscriptionId(
   subscriptionId,
   dados
@@ -3681,6 +3739,622 @@ app.post(
 );
  
  
+
+// ============================================================
+// 3-B. TROCA IMEDIATA DE PLANO RECORRENTE
+// ============================================================
+//
+// Requer Authorization: Bearer <access_token do Supabase>.
+//
+// Regra do Ache Obra:
+// - serve tanto para upgrade quanto para downgrade;
+// - não há crédito proporcional do ciclo anterior;
+// - a nova assinatura começa imediatamente;
+// - a assinatura antiga é cancelada imediatamente;
+// - o plano antigo permanece no histórico como cancelado;
+// - a nova assinatura é registrada como a assinatura vigente.
+//
+// Segurança contra estado inconsistente:
+// 1. autentica o usuário pelo Supabase;
+// 2. busca a assinatura recorrente atual;
+// 3. lê o novo plano diretamente de tab_planos;
+// 4. cria e cobra a nova assinatura na Efí;
+// 5. cancela a assinatura antiga na Efí;
+// 6. se o cancelamento da antiga falhar, tenta cancelar a nova
+//    como compensação e NÃO altera a assinatura antiga no Supabase;
+// 7. somente depois atualiza os registros no Supabase.
+//
+// Body esperado:
+// {
+//   "plano_id": "UUID_DO_NOVO_PLANO_NO_SUPABASE",
+//   "email": "...",
+//   "nome": "...",
+//   "cpf": "...",
+//   "telefone": "...",
+//   "payment_token": "...",
+//   "descricao": "..." // opcional
+// }
+// ============================================================
+
+app.post(
+  '/trocar-assinatura',
+
+  async (req, res) => {
+    let novaSubscriptionId = null;
+    let novaAssinaturaSalva = false;
+
+    try {
+      const usuario =
+        await obterUsuarioSupabaseDoBearer(req);
+
+      if (!usuario?.id) {
+        return res
+          .status(401)
+          .json({
+            success: false,
+            error: 'Usuário não autenticado.',
+          });
+      }
+
+      const {
+        plano_id,
+        email,
+        nome,
+        cpf,
+        telefone,
+        payment_token,
+        descricao,
+      } = req.body || {};
+
+      const novoPlanoId =
+        String(plano_id || '').trim();
+
+      if (!novoPlanoId) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            error:
+              'plano_id do novo plano no Supabase é obrigatório.',
+          });
+      }
+
+      if (!nome || !cpf || !email || !telefone || !payment_token) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            error:
+              'Nome, CPF, e-mail, telefone e payment_token são obrigatórios.',
+          });
+      }
+
+      const assinaturaAtual =
+        await buscarAssinaturaAtivaPorUsuario(
+          usuario.id
+        );
+
+      if (!assinaturaAtual) {
+        return res
+          .status(409)
+          .json({
+            success: false,
+            error:
+              'Nenhuma assinatura recorrente atual foi encontrada. Para a primeira assinatura use /cobrar-assinatura.',
+            usar_rota:
+              '/cobrar-assinatura',
+          });
+      }
+
+      const assinaturaAtualId =
+        String(
+          assinaturaAtual.efi_subscription_id || ''
+        ).trim();
+
+      if (!assinaturaAtualId) {
+        return res
+          .status(409)
+          .json({
+            success: false,
+            error:
+              'A assinatura atual não possui efi_subscription_id.',
+          });
+      }
+
+      if (
+        String(assinaturaAtual.plano_id || '').trim() ===
+        novoPlanoId
+      ) {
+        return res
+          .status(409)
+          .json({
+            success: false,
+            error:
+              'O plano escolhido já é o plano recorrente atual do usuário.',
+          });
+      }
+
+      const novoPlano =
+        await buscarPlanoRecorrentePorIdSupabase(
+          novoPlanoId
+        );
+
+      if (!novoPlano) {
+        return res
+          .status(404)
+          .json({
+            success: false,
+            error:
+              'Novo plano não encontrado no Supabase.',
+          });
+      }
+
+      const novoPlanIdEfi =
+        String(
+          novoPlano.efi_plan_id || ''
+        ).trim();
+
+      const novoValor =
+        Number(
+          novoPlano.valor_recorrente
+        );
+
+      if (!novoPlanIdEfi) {
+        return res
+          .status(409)
+          .json({
+            success: false,
+            error:
+              'O novo plano ainda não possui efi_plan_id sincronizado.',
+          });
+      }
+
+      if (
+        !Number.isFinite(novoValor) ||
+        novoValor <= 0
+      ) {
+        return res
+          .status(409)
+          .json({
+            success: false,
+            error:
+              'O novo plano não possui valor_recorrente válido.',
+          });
+      }
+
+      if (
+        novoPlano.recorrencia_ativa === false
+      ) {
+        return res
+          .status(409)
+          .json({
+            success: false,
+            error:
+              'A recorrência do novo plano está desativada.',
+          });
+      }
+
+      const cpfLimpo =
+        String(cpf)
+          .replace(/\D/g, '');
+
+      if (cpfLimpo.length !== 11) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            error: 'CPF inválido.',
+          });
+      }
+
+      let telefoneLimpo =
+        String(telefone)
+          .replace(/\D/g, '');
+
+      if (
+        telefoneLimpo.startsWith('55') &&
+        (
+          telefoneLimpo.length === 12 ||
+          telefoneLimpo.length === 13
+        )
+      ) {
+        telefoneLimpo =
+          telefoneLimpo.substring(2);
+      }
+
+      if (
+        telefoneLimpo.length !== 10 &&
+        telefoneLimpo.length !== 11
+      ) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            error:
+              'Telefone inválido. Informe DDD + número.',
+          });
+      }
+
+      const valorCentavos =
+        Math.round(novoValor * 100);
+
+      const accessToken =
+        await obterTokenCobranca();
+
+      const customId =
+        montarCustomId({
+          usuario_id: usuario.id,
+          origem_tipo: 'plano_categoria',
+          origem_id: novoPlanoId,
+          prefixo:
+            'acheobra-troca-assinatura',
+        });
+
+      const payload = {
+        items: [
+          {
+            name:
+              descricao ||
+              `Plano recorrente Ache Obra - ${novoPlano.nome_plano || 'Plano'}`,
+            value:
+              valorCentavos,
+            amount:
+              1,
+          },
+        ],
+
+        metadata: {
+          custom_id:
+            customId,
+          notification_url:
+            EFI_NOTIFICATION_URL,
+        },
+
+        payment: {
+          credit_card: {
+            customer: {
+              name:
+                String(nome).trim(),
+              cpf:
+                cpfLimpo,
+              email:
+                String(email)
+                  .trim()
+                  .toLowerCase(),
+              phone_number:
+                telefoneLimpo,
+            },
+            payment_token:
+              payment_token,
+          },
+        },
+      };
+
+      console.log(
+        '=========================================='
+      );
+      console.log(
+        `>>> TROCA DE PLANO RECORRENTE - usuário ${usuario.id}`
+      );
+      console.log(
+        `>>> Assinatura atual: ${assinaturaAtualId}`
+      );
+      console.log(
+        `>>> Novo plano Supabase: ${novoPlanoId}`
+      );
+      console.log(
+        `>>> Novo plan_id Efí: ${novoPlanIdEfi}`
+      );
+
+      // --------------------------------------------------------
+      // 1. CRIA A NOVA ASSINATURA NA EFÍ
+      // --------------------------------------------------------
+      // Criamos primeiro para não deixar o usuário sem assinatura
+      // caso o novo cartão/pagamento seja recusado.
+      // --------------------------------------------------------
+
+      const responseNova =
+        await axios({
+          method: 'POST',
+          url:
+            `${EFI_COBRANCA_API_URL}/plan/${encodeURIComponent(
+              novoPlanIdEfi
+            )}/subscription/one-step`,
+          headers: {
+            Authorization:
+              `Bearer ${accessToken}`,
+            'Content-Type':
+              'application/json',
+          },
+          data:
+            payload,
+          httpsAgent,
+          timeout:
+            30000,
+        });
+
+      const novaAssinaturaEfi =
+        responseNova.data?.data || {};
+
+      novaSubscriptionId =
+        novaAssinaturaEfi.subscription_id
+          ? String(
+              novaAssinaturaEfi.subscription_id
+            )
+          : null;
+
+      const novoStatusEfi =
+        String(
+          novaAssinaturaEfi.status || ''
+        )
+          .trim()
+          .toLowerCase();
+
+      const novaCharge =
+        novaAssinaturaEfi.charge || null;
+
+      if (!novaSubscriptionId) {
+        throw new Error(
+          'A Efí criou a cobrança, mas não retornou subscription_id da nova assinatura.'
+        );
+      }
+
+      if (novoStatusEfi !== 'active') {
+        // Se por algum motivo a API retornar assinatura não ativa,
+        // não cancelamos a antiga.
+        try {
+          await cancelarAssinaturaEfiPorId(
+            accessToken,
+            novaSubscriptionId
+          );
+        } catch (erroCancelamentoNova) {
+          console.error(
+            '>>> Não foi possível cancelar a nova assinatura não ativa durante a compensação:',
+            erroCancelamentoNova.response?.data ||
+            erroCancelamentoNova.message
+          );
+        }
+
+        return res
+          .status(409)
+          .json({
+            success: false,
+            error:
+              'A nova assinatura não ficou ativa. A assinatura anterior foi preservada.',
+            status_nova_assinatura:
+              novoStatusEfi || null,
+            nova_subscription_id:
+              novaSubscriptionId,
+          });
+      }
+
+      // --------------------------------------------------------
+      // 2. CANCELA A ASSINATURA ANTIGA NA EFÍ
+      // --------------------------------------------------------
+
+      try {
+        await cancelarAssinaturaEfiPorId(
+          accessToken,
+          assinaturaAtualId
+        );
+      } catch (erroCancelarAntiga) {
+        console.error(
+          '>>> Falha ao cancelar assinatura antiga. Tentando desfazer a nova assinatura:',
+          erroCancelarAntiga.response?.data ||
+          erroCancelarAntiga.message
+        );
+
+        let novaCanceladaNaCompensacao =
+          false;
+
+        try {
+          await cancelarAssinaturaEfiPorId(
+            accessToken,
+            novaSubscriptionId
+          );
+
+          novaCanceladaNaCompensacao =
+            true;
+        } catch (erroCompensacao) {
+          console.error(
+            '>>> ATENÇÃO: também falhou o cancelamento compensatório da nova assinatura:',
+            erroCompensacao.response?.data ||
+            erroCompensacao.message
+          );
+        }
+
+        return res
+          .status(502)
+          .json({
+            success: false,
+            error:
+              'Não foi possível cancelar a assinatura anterior na Efí. A troca não foi concluída.',
+            assinatura_anterior_preservada:
+              true,
+            nova_subscription_id:
+              novaSubscriptionId,
+            nova_cancelada_compensacao:
+              novaCanceladaNaCompensacao,
+            requer_atencao_manual:
+              !novaCanceladaNaCompensacao,
+          });
+      }
+
+      const agora =
+        new Date().toISOString();
+
+      // --------------------------------------------------------
+      // 3. MARCA A ANTIGA COMO CANCELADA NO SUPABASE
+      // --------------------------------------------------------
+
+      await atualizarAssinaturaPorSubscriptionId(
+        assinaturaAtualId,
+        {
+          status_assinatura:
+            'cancelado',
+          ultimo_status_efi:
+            'canceled',
+          cancelado_em:
+            agora,
+          motivo_cancelamento:
+            `Troca imediata para o plano ${novoPlano.nome_plano || novoPlanoId}.`,
+          data_inicio_inadimplencia:
+            null,
+          data_fim_carencia:
+            null,
+        }
+      );
+
+      // --------------------------------------------------------
+      // 4. REGISTRA A NOVA ASSINATURA NO SUPABASE
+      // --------------------------------------------------------
+
+      const registroNovaAssinatura =
+        await inserirOuAtualizarAssinaturaSupabase({
+          usuario_id:
+            String(usuario.id),
+          plano_id:
+            novoPlanoId,
+          efi_subscription_id:
+            novaSubscriptionId,
+          efi_plan_id:
+            novoPlanIdEfi,
+          efi_charge_id:
+            novaCharge?.charge_id
+              ? String(novaCharge.charge_id)
+              : null,
+          status_assinatura:
+            'ativo',
+          ultimo_status_efi:
+            novaCharge?.status ||
+            novoStatusEfi ||
+            'active',
+          valor_recorrente:
+            novoValor,
+          data_inicio:
+            agora,
+          data_ultimo_pagamento:
+            (
+              novaCharge?.status === 'paid' ||
+              novaCharge?.status === 'approved' ||
+              novaCharge?.status === 'settled'
+            )
+              ? agora
+              : null,
+          proxima_cobranca_em:
+            normalizarDataIso(
+              novaAssinaturaEfi.next_execution
+            ),
+          data_inicio_inadimplencia:
+            null,
+          data_fim_carencia:
+            null,
+          cancelado_em:
+            null,
+          motivo_cancelamento:
+            null,
+        });
+
+      novaAssinaturaSalva =
+        Boolean(registroNovaAssinatura);
+
+      console.log(
+        `>>> Troca concluída: ${assinaturaAtualId} -> ${novaSubscriptionId}.`
+      );
+      console.log(
+        '=========================================='
+      );
+
+      return res
+        .status(201)
+        .json({
+          success: true,
+          approved: true,
+          pago: true,
+          troca_plano: true,
+          plano_anterior_id:
+            assinaturaAtual.plano_id || null,
+          plano_novo_id:
+            novoPlanoId,
+          plano_novo_nome:
+            novoPlano.nome_plano || null,
+          valor_recorrente:
+            novoValor,
+          assinatura_anterior: {
+            subscription_id:
+              assinaturaAtualId,
+            status:
+              'cancelado',
+          },
+          assinatura_nova: {
+            subscription_id:
+              novaSubscriptionId,
+            status:
+              novoStatusEfi,
+            charge:
+              novaCharge,
+            next_execution:
+              novaAssinaturaEfi.next_execution ||
+              null,
+          },
+          registro_assinatura_salvo:
+            novaAssinaturaSalva,
+          data:
+            novaAssinaturaEfi,
+        });
+
+    } catch (error) {
+      console.error(
+        '=========================================='
+      );
+      console.error(
+        'ERRO AO TROCAR PLANO RECORRENTE'
+      );
+      console.error(
+        error.response?.data ||
+        error.message
+      );
+      console.error(
+        '=========================================='
+      );
+
+      const respostaEfi =
+        error.response?.data;
+
+      let mensagem =
+        respostaEfi?.error_description ||
+        respostaEfi?.mensagem ||
+        respostaEfi?.message ||
+        respostaEfi?.error ||
+        error.message;
+
+      if (typeof mensagem !== 'string') {
+        mensagem =
+          JSON.stringify(mensagem);
+      }
+
+      return res
+        .status(
+          error.response?.status ||
+          500
+        )
+        .json({
+          success: false,
+          approved: false,
+          troca_plano: false,
+          error: mensagem,
+          nova_subscription_id:
+            novaSubscriptionId,
+          nova_assinatura_salva:
+            novaAssinaturaSalva,
+          efi:
+            respostaEfi || null,
+        });
+    }
+  }
+);
+
+
 // ============================================================
 // 4. WEBHOOK / NOTIFICAÇÕES DA EFÍ
 // ============================================================
@@ -4821,6 +5495,9 @@ app.get(
  
         assinatura:
           '/cobrar-assinatura',
+
+        trocar_assinatura:
+          '/trocar-assinatura',
  
         sincronizar_planos_efi:
           '/sincronizar-planos-efi',

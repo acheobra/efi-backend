@@ -1,13 +1,376 @@
+// ============================================================
+// ACHE OBRA - BACKEND EFÍ COM LOGS SEGUROS DE TRANSAÇÕES
+// Gerado a partir do server.js fornecido pelo usuário.
+// A lógica financeira original foi preservada.
+// ============================================================
+
 const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
 const https = require('https');
 const path = require('path');
+const crypto = require('crypto');
  
 const app = express();
  
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// ============================================================
+// LOGS SEGUROS DE TRANSAÇÕES
+// ============================================================
+//
+// Objetivos:
+// - Gerar um ID único para acompanhar cada operação no Render.
+// - Registrar início, fim, HTTP, duração e resultado operacional.
+// - NÃO registrar CPF, e-mail, telefone, nome, número do cartão,
+//   CVV, payment_token, Authorization, Client Secret, chaves,
+//   service_role do Supabase ou conteúdo integral de req.body.
+// - O usuario_id é convertido em referência SHA-256 curta.
+// - IDs técnicos de pagamento (txid, charge_id, subscription_id)
+//   podem aparecer para permitir conciliação e suporte.
+//
+// IMPORTANTE:
+// Este bloco é apenas de observabilidade. Ele não altera a regra
+// de cobrança, confirmação, cancelamento, estorno ou assinatura.
+// ============================================================
+
+function gerarIdOperacao() {
+  return (
+    `${Date.now().toString(36)}-` +
+    crypto.randomBytes(4).toString('hex')
+  );
+}
+
+function referenciaSegura(valor) {
+  const texto = String(valor ?? '').trim();
+
+  if (!texto) {
+    return null;
+  }
+
+  return crypto
+    .createHash('sha256')
+    .update(texto)
+    .digest('hex')
+    .substring(0, 12);
+}
+
+function sanitizarTextoSeguro(valor) {
+  let texto = String(valor ?? '');
+
+  // E-mail.
+  texto = texto.replace(
+    /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi,
+    '[EMAIL_REMOVIDO]'
+  );
+
+  // Bearer / JWT.
+  texto = texto.replace(
+    /Bearer\s+[A-Za-z0-9._~+/=-]+/gi,
+    'Bearer [TOKEN_REMOVIDO]'
+  );
+
+  texto = texto.replace(
+    /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
+    '[JWT_REMOVIDO]'
+  );
+
+  // Sequências numéricas longas: CPF, cartão, telefone etc.
+  // Preserva números pequenos úteis como códigos HTTP.
+  texto = texto.replace(
+    /\b\d{6,19}\b/g,
+    '[NUMERO_REMOVIDO]'
+  );
+
+  // Limita tamanho para evitar despejar payloads inteiros.
+  if (texto.length > 500) {
+    texto = `${texto.substring(0, 500)}...[TRUNCADO]`;
+  }
+
+  return texto;
+}
+
+function resumirErroSeguro(error) {
+  if (typeof error === 'string') {
+    return {
+      http_status: null,
+      codigo: null,
+      mensagem: sanitizarTextoSeguro(error),
+    };
+  }
+
+  const statusHttp =
+    error?.response?.status ||
+    error?.status ||
+    null;
+
+  const dados =
+    error?.response?.data ||
+    (
+      error &&
+      typeof error === 'object'
+        ? error
+        : {}
+    );
+
+  let codigo =
+    dados?.code ||
+    dados?.error_code ||
+    (
+      typeof dados?.error === 'string'
+        ? dados.error
+        : null
+    ) ||
+    error?.code ||
+    null;
+
+  if (
+    codigo &&
+    typeof codigo !== 'string' &&
+    typeof codigo !== 'number'
+  ) {
+    codigo = null;
+  }
+
+  const mensagem =
+    dados?.error_description ||
+    dados?.message ||
+    dados?.mensagem ||
+    error?.message ||
+    'Erro não identificado';
+
+  return {
+    http_status: statusHttp,
+    codigo: codigo
+      ? sanitizarTextoSeguro(codigo)
+      : null,
+    mensagem: sanitizarTextoSeguro(mensagem),
+  };
+}
+
+function resumoEntradaSeguro(req) {
+  const body =
+    req?.body &&
+    typeof req.body === 'object'
+      ? req.body
+      : {};
+
+  const params =
+    req?.params &&
+    typeof req.params === 'object'
+      ? req.params
+      : {};
+
+  const resumo = {};
+
+  if (body.valor !== undefined && body.valor !== null) {
+    const numero = Number(body.valor);
+
+    resumo.valor =
+      Number.isFinite(numero)
+        ? numero
+        : 'informado';
+  }
+
+  if (body.origem_tipo) {
+    resumo.origem_tipo =
+      sanitizarTextoSeguro(body.origem_tipo);
+  }
+
+  if (body.origem_id) {
+    resumo.origem_id =
+      String(body.origem_id);
+  }
+
+  if (body.plano_id) {
+    resumo.plano_id =
+      String(body.plano_id);
+  }
+
+  if (body.pagamento_id) {
+    resumo.pagamento_id =
+      String(body.pagamento_id);
+  }
+
+  if (body.charge_id) {
+    resumo.charge_id =
+      String(body.charge_id);
+  }
+
+  if (body.subscription_id) {
+    resumo.subscription_id =
+      String(body.subscription_id);
+  }
+
+  if (params.txid) {
+    resumo.txid =
+      String(params.txid);
+  }
+
+  if (body.txid) {
+    resumo.txid =
+      String(body.txid);
+  }
+
+  if (body.usuario_id) {
+    resumo.usuario_ref =
+      referenciaSegura(body.usuario_id);
+  }
+
+  // Apenas informa a presença; nunca registra o token.
+  if (body.payment_token) {
+    resumo.payment_token =
+      '[PRESENTE_E_OCULTO]';
+  }
+
+  return resumo;
+}
+
+function resumoRespostaSeguro(dados) {
+  if (
+    !dados ||
+    typeof dados !== 'object'
+  ) {
+    return {};
+  }
+
+  const resumo = {};
+
+  const chavesSeguras = [
+    'success',
+    'pago',
+    'status',
+    'status_efi',
+    'txid',
+    'charge_id',
+    'efi_charge_id',
+    'subscription_id',
+    'efi_subscription_id',
+    'pagamento_id',
+    'payment_id',
+    'plano_id',
+    'ja_estornado',
+    'processado',
+    'encontrado',
+  ];
+
+  for (const chave of chavesSeguras) {
+    if (
+      dados[chave] !== undefined &&
+      dados[chave] !== null &&
+      typeof dados[chave] !== 'object'
+    ) {
+      resumo[chave] =
+        dados[chave];
+    }
+  }
+
+  if (dados.error) {
+    if (typeof dados.error === 'string') {
+      resumo.erro =
+        sanitizarTextoSeguro(dados.error);
+    } else {
+      resumo.erro =
+        '[DETALHES_OCULTOS]';
+    }
+  }
+
+  if (dados.message && typeof dados.message === 'string') {
+    resumo.mensagem =
+      sanitizarTextoSeguro(dados.message);
+  }
+
+  return resumo;
+}
+
+function rotaFinanceiraParaLog(req) {
+  const caminho =
+    String(req.path || '');
+
+  return (
+    caminho === '/sincronizar-planos-efi' ||
+    caminho === '/gerar-pix' ||
+    caminho.startsWith('/status-pix/') ||
+    caminho === '/cobrar-cartao' ||
+    caminho === '/cobrar-assinatura' ||
+    caminho === '/trocar-assinatura' ||
+    caminho === '/webhook/efi' ||
+    caminho === '/cancelar-pagamento-pix' ||
+    caminho === '/cancelar-pagamento-cartao' ||
+    caminho === '/cancelar-assinatura' ||
+    caminho === '/processar-inadimplencia' ||
+    caminho === '/registrar-assinatura-existente'
+  );
+}
+
+app.use((req, res, next) => {
+  if (
+    req.method === 'OPTIONS' ||
+    !rotaFinanceiraParaLog(req)
+  ) {
+    return next();
+  }
+
+  const operacaoId =
+    gerarIdOperacao();
+
+  const inicio =
+    Date.now();
+
+  req.operacaoId =
+    operacaoId;
+
+  let resumoSaida = {};
+
+  console.log(
+    `[TX ${operacaoId}] INICIO ${req.method} ${req.path}`,
+    resumoEntradaSeguro(req)
+  );
+
+  const jsonOriginal =
+    res.json.bind(res);
+
+  res.json = (dados) => {
+    try {
+      resumoSaida =
+        resumoRespostaSeguro(dados);
+    } catch (_) {
+      resumoSaida = {};
+    }
+
+    return jsonOriginal(dados);
+  };
+
+  res.on('finish', () => {
+    const duracaoMs =
+      Date.now() - inicio;
+
+    const nivel =
+      res.statusCode >= 400
+        ? 'FALHA'
+        : 'FIM';
+
+    console.log(
+      `[TX ${operacaoId}] ${nivel} ${req.method} ${req.path}` +
+      ` | HTTP ${res.statusCode}` +
+      ` | ${duracaoMs} ms`,
+      resumoSaida
+    );
+  });
+
+  res.on('close', () => {
+    if (!res.writableFinished) {
+      console.warn(
+        `[TX ${operacaoId}] CONEXÃO ENCERRADA ANTES DA RESPOSTA` +
+        ` | ${req.method} ${req.path}`
+      );
+    }
+  });
+
+  next();
+});
+
  
 // ============================================================
 // CORS
@@ -1253,8 +1616,7 @@ async function processarCarenciasVencidas() {
   } catch (error) {
     console.error(
       '>>> Erro ao processar carências vencidas:',
-      error.response?.data ||
-      error.message
+      resumirErroSeguro(error)
     );
  
     return 0;
@@ -1378,13 +1740,13 @@ async function aplicarEventoNotificacaoEfi(
           estorno_avulso: resultadoEstorno,
         };
       } catch (error) {
-        console.error('>>> Erro ao processar estorno pendente pelo webhook:', error.response?.data || error.message);
+        console.error('>>> Erro ao processar estorno pendente pelo webhook:', resumirErroSeguro(error));
         return {
           ignorado: false,
           tipo,
           status: statusAtual,
           charge_id: String(chargeId),
-          erro_estorno_avulso: error.response?.data || error.message,
+          erro_estorno_avulso: resumirErroSeguro(error),
         };
       }
     }
@@ -2103,7 +2465,7 @@ app.post(
  
           console.error(
             `>>> ERRO no plano "${nomePlano}":`,
-            mensagemErro
+            sanitizarTextoSeguro(mensagemErro)
           );
  
           try {
@@ -2135,11 +2497,7 @@ app.post(
  
             console.error(
               '>>> Também falhou ao registrar o erro no Supabase:',
-              erroAtualizacao
-                .response
-                ?.data ||
-              erroAtualizacao
-                .message
+              resumirErroSeguro(erroAtualizacao)
             );
           }
  
@@ -2225,8 +2583,7 @@ app.post(
       );
  
       console.error(
-        error.response?.data ||
-        error.message
+        resumirErroSeguro(error)
       );
  
       return res
@@ -2240,9 +2597,7 @@ app.post(
             false,
  
           error:
-            error.response
-              ?.data ||
-            error.message,
+            resumirErroSeguro(error),
         });
  
     } finally {
@@ -2434,7 +2789,7 @@ app.post(
 
           console.error(
             '>>> Pix gerado, mas falhou ao registrar em tab_pagamentos_avulsos:',
-            erroRegistroPagamentoAvulso
+            resumirErroSeguro(erroRegistroPagamentoAvulso)
           );
         }
       }
@@ -2455,8 +2810,7 @@ app.post(
  
       console.error(
         'Erro ao gerar Pix:',
-        error.response?.data ||
-        error.message
+        resumirErroSeguro(error)
       );
  
       return res
@@ -2547,8 +2901,7 @@ app.get(
     } catch (error) {
       console.error(
         '>>> ERRO AO CONSULTAR STATUS PIX:',
-        error.response?.data ||
-        error.message
+        resumirErroSeguro(error)
       );
 
       return res
@@ -2556,8 +2909,7 @@ app.get(
         .json({
           success: false,
           error:
-            error.response?.data ||
-            error.message,
+            resumirErroSeguro(error),
         });
     }
   }
@@ -2760,8 +3112,8 @@ app.post(
         });
  
       console.log(
-        '>>> Custom ID:',
-        customId
+        '>>> Custom ID ref:',
+        referenciaSegura(customId)
       );
  
       // --------------------------------------------------------
@@ -2935,7 +3287,7 @@ app.post(
 
           console.error(
             '>>> Cobrança aprovada na Efí, mas falhou ao registrar em tab_pagamentos_avulsos:',
-            erroRegistroPagamentoAvulso
+            resumirErroSeguro(erroRegistroPagamentoAvulso)
           );
         }
       }
@@ -3019,8 +3371,8 @@ status:
       );
  
       console.error(
-        'Resposta Efí:',
-        error.response?.data
+        'Resposta Efí (segura):',
+        resumirErroSeguro(error)
       );
  
       console.error(
@@ -3341,8 +3693,8 @@ app.post(
         });
  
       console.log(
-        '>>> Custom ID da assinatura:',
-        customId
+        '>>> Custom ID da assinatura ref:',
+        referenciaSegura(customId)
       );
  
       // --------------------------------------------------------
@@ -3578,7 +3930,7 @@ app.post(
  
           console.warn(
             '>>> Assinatura criada na Efí, mas não foi possível registrar em tab_assinaturas:',
-            erroRegistroAssinatura
+            resumirErroSeguro(erroRegistroAssinatura)
           );
         }
  
@@ -3589,7 +3941,7 @@ app.post(
  
         console.error(
           '>>> Assinatura foi criada na Efí, mas falhou ao salvar em tab_assinaturas:',
-          erroRegistroAssinatura
+          resumirErroSeguro(erroRegistroAssinatura)
         );
       }
  
@@ -3667,8 +4019,8 @@ app.post(
       );
  
       console.error(
-        'Resposta Efí:',
-        error.response?.data
+        'Resposta Efí (segura):',
+        resumirErroSeguro(error)
       );
  
       console.error(
@@ -4034,7 +4386,7 @@ app.post(
         '=========================================='
       );
       console.log(
-        `>>> TROCA DE PLANO RECORRENTE - usuário ${usuario.id}`
+        `>>> TROCA DE PLANO RECORRENTE - usuário ref ${referenciaSegura(usuario.id)}`
       );
       console.log(
         `>>> Assinatura atual: ${assinaturaAtualId}`
@@ -4110,8 +4462,7 @@ app.post(
         } catch (erroCancelamentoNova) {
           console.error(
             '>>> Não foi possível cancelar a nova assinatura não ativa durante a compensação:',
-            erroCancelamentoNova.response?.data ||
-            erroCancelamentoNova.message
+            resumirErroSeguro(erroCancelamentoNova)
           );
         }
 
@@ -4140,8 +4491,7 @@ app.post(
       } catch (erroCancelarAntiga) {
         console.error(
           '>>> Falha ao cancelar assinatura antiga. Tentando desfazer a nova assinatura:',
-          erroCancelarAntiga.response?.data ||
-          erroCancelarAntiga.message
+          resumirErroSeguro(erroCancelarAntiga)
         );
 
         let novaCanceladaNaCompensacao =
@@ -4158,8 +4508,7 @@ app.post(
         } catch (erroCompensacao) {
           console.error(
             '>>> ATENÇÃO: também falhou o cancelamento compensatório da nova assinatura:',
-            erroCompensacao.response?.data ||
-            erroCompensacao.message
+            resumirErroSeguro(erroCompensacao)
           );
         }
 
@@ -4311,8 +4660,7 @@ app.post(
         'ERRO AO TROCAR PLANO RECORRENTE'
       );
       console.error(
-        error.response?.data ||
-        error.message
+        resumirErroSeguro(error)
       );
       console.error(
         '=========================================='
@@ -4399,8 +4747,8 @@ app.post(
     );
  
     console.log(
-      '>>> Token:',
-      notificationToken
+      '>>> Referência segura da notificação:',
+      referenciaSegura(notificationToken)
     );
  
     console.log(
@@ -4447,8 +4795,7 @@ app.post(
     } catch (error) {
       console.error(
         '>>> ERRO NO WEBHOOK EFÍ:',
-        error.response?.data ||
-        error.message
+        resumirErroSeguro(error)
       );
  
       return res
@@ -4459,8 +4806,7 @@ app.post(
         .json({
           success: false,
           error:
-            error.response?.data ||
-            error.message,
+            resumirErroSeguro(error),
         });
     }
   }
@@ -4476,7 +4822,7 @@ app.post(
   async (req, res) => {
     console.log('==========================================');
     console.log('>>> SOLICITAÇÃO DE CANCELAMENTO PIX AVULSO');
-    console.log('>>> Body:', req.body);
+    console.log('>>> Dados seguros da solicitação:', resumoEntradaSeguro(req));
     console.log('==========================================');
 
     try {
@@ -4703,8 +5049,7 @@ app.post(
         } catch (consultaError) {
           console.warn(
             '>>> Não foi possível consultar devolução Pix já solicitada:',
-            consultaError.response?.data ||
-            consultaError.message
+            resumirErroSeguro(consultaError)
           );
         }
       }
@@ -4841,8 +5186,7 @@ app.post(
     } catch (error) {
       console.error(
         '>>> ERRO AO DEVOLVER PAGAMENTO PIX:',
-        error.response?.data ||
-        error.message
+        resumirErroSeguro(error)
       );
 
       const respostaEfi =
@@ -4882,7 +5226,7 @@ app.post(
   async (req, res) => {
     console.log('==========================================');
     console.log('>>> SOLICITAÇÃO DE CANCELAMENTO CARTÃO AVULSO');
-    console.log('>>> Body:', req.body);
+    console.log('>>> Dados seguros da solicitação:', resumoEntradaSeguro(req));
     console.log('==========================================');
 
     try {
@@ -4891,7 +5235,7 @@ app.post(
         console.warn('>>> Cancelamento recusado: usuário não autenticado.');
         return res.status(401).json({ success: false, error: 'Usuário não autenticado.' });
       }
-      console.log('>>> Usuário autenticado:', usuario.id);
+      console.log('>>> Usuário autenticado ref:', referenciaSegura(usuario.id));
 
       const pagamentoId = String(req.body?.pagamento_id || '').trim();
       const motivoCancelamento = String(
@@ -4991,7 +5335,7 @@ app.post(
 
       return res.json({ success: true, status: 'estorno_solicitado', mensagem: 'Solicitação de estorno enviada à Efí. O reembolso está em processamento.', pagamento_id: pagamento.id, charge_id: chargeId, data_pagamento: dataPagamento.toISOString(), limite_cancelamento: limiteEstorno.toISOString(), pagamento: pagamentoAtualizado, efi: respostaEstorno.data });
     } catch (error) {
-      console.error('>>> ERRO AO ESTORNAR PAGAMENTO AVULSO NO CARTÃO:', error.response?.data || error.message);
+      console.error('>>> ERRO AO ESTORNAR PAGAMENTO AVULSO NO CARTÃO:', resumirErroSeguro(error));
       const respostaEfi = error.response?.data;
       let mensagem = respostaEfi?.error_description || respostaEfi?.mensagem || respostaEfi?.message || respostaEfi?.error || error.message;
       if (typeof mensagem !== 'string') mensagem = JSON.stringify(mensagem);
@@ -5063,7 +5407,7 @@ app.post(
         await obterTokenCobranca();
  
       console.log(
-        `>>> Cancelando assinatura Efí ${subscriptionId} do usuário ${usuario.id}.`
+        `>>> Cancelando assinatura Efí ${subscriptionId} do usuário ref ${referenciaSegura(usuario.id)}.`
       );
  
       await axios({
@@ -5132,8 +5476,7 @@ app.post(
     } catch (error) {
       console.error(
         '>>> ERRO AO CANCELAR ASSINATURA:',
-        error.response?.data ||
-        error.message
+        resumirErroSeguro(error)
       );
  
       const respostaEfi =
@@ -5442,8 +5785,7 @@ app.post(
     } catch (error) {
       console.error(
         '>>> ERRO AO REGISTRAR ASSINATURA EXISTENTE:',
-        error.response?.data ||
-        error.message
+        resumirErroSeguro(error)
       );
  
       return res
@@ -5454,8 +5796,7 @@ app.post(
         .json({
           success: false,
           error:
-            error.response?.data ||
-            error.message,
+            resumirErroSeguro(error),
         });
     }
   }
@@ -5560,11 +5901,11 @@ async function processarEstornosPendentes() {
     for (const pagamento of pendentes) {
       if (!pagamento.efi_charge_id) continue;
       try { await processarEstornoPendentePorChargeId(String(pagamento.efi_charge_id)); }
-      catch (error) { console.error(`>>> Falha ao reprocessar estorno pendente ${pagamento.id}:`, error.response?.data || error.message); }
+      catch (error) { console.error(`>>> Falha ao reprocessar estorno pendente ${pagamento.id}:`, resumirErroSeguro(error)); }
     }
     return pendentes.length;
   } catch (error) {
-    console.error('>>> Erro ao buscar/processar estornos pendentes:', error.response?.data || error.message);
+    console.error('>>> Erro ao buscar/processar estornos pendentes:', resumirErroSeguro(error));
     return 0;
 
   } finally {
@@ -5634,8 +5975,7 @@ async function processarDevolucoesPixPendentes() {
       } catch (error) {
         console.error(
           `>>> Falha ao reprocessar devolução Pix ${pagamento.id}:`,
-          error.response?.data ||
-          error.message
+          resumirErroSeguro(error)
         );
       }
     }
@@ -5645,8 +5985,7 @@ async function processarDevolucoesPixPendentes() {
   } catch (error) {
     console.error(
       '>>> Erro ao buscar/processar devoluções Pix pendentes:',
-      error.response?.data ||
-      error.message
+      resumirErroSeguro(error)
     );
 
     return 0;

@@ -1362,7 +1362,12 @@ async function inserirOuAtualizarAssinaturaSupabase(dados) {
     );
   }
  
-  const response = await axios({
+  // IMPORTANTE:
+  // Usa o wrapper com retry porque o PostgREST pode retornar
+  // transitoriamente PGRST303 / "JWT issued at future" por clock skew.
+  // Sem retry, a assinatura já pode existir na Efí e falhar somente
+  // na gravação local, gerando 502 e deixando o histórico órfão.
+  const response = await requisicaoSupabaseInterna({
     method: 'POST',
  
     url:
@@ -1374,8 +1379,6 @@ async function inserirOuAtualizarAssinaturaSupabase(dados) {
     },
  
     headers: {
-      ...obterHeadersSupabase(),
- 
       Prefer:
         'resolution=merge-duplicates,return=representation',
     },
@@ -1397,7 +1400,7 @@ async function buscarAssinaturaPorSubscriptionId(
     supabaseUrl,
   } = obterConfiguracaoSupabase();
  
-  const response = await axios({
+  const response = await requisicaoSupabaseInterna({
     method: 'GET',
  
     url:
@@ -1412,9 +1415,6 @@ async function buscarAssinaturaPorSubscriptionId(
       limit:
         1,
     },
- 
-    headers:
-      obterHeadersSupabase(),
  
     timeout:
       30000,
@@ -1432,7 +1432,7 @@ async function buscarAssinaturaAtivaPorUsuario(
     supabaseUrl,
   } = obterConfiguracaoSupabase();
  
-  const response = await axios({
+  const response = await requisicaoSupabaseInterna({
     method: 'GET',
  
     url:
@@ -1454,8 +1454,6 @@ async function buscarAssinaturaAtivaPorUsuario(
         1,
     },
  
-    headers:
-      obterHeadersSupabase(),
  
     timeout:
       30000,
@@ -1466,6 +1464,68 @@ async function buscarAssinaturaAtivaPorUsuario(
     : null;
 }
  
+
+
+// ============================================================
+// SUPABASE - RECONCILIAR PAGAMENTOS RECORRENTES ÓRFÃOS
+// ============================================================
+//
+// O webhook da Efí pode chegar antes de tab_assinaturas ser gravada.
+// Nesse caso o histórico é preservado apenas com efi_subscription_id
+// e efi_charge_id. Assim que o contrato existir, este helper completa
+// assinatura_id, usuario_id, plano_id e efi_plan_id nas linhas órfãs.
+// ============================================================
+
+async function vincularPagamentosRecorrentesOrfaosAssinatura(assinatura) {
+  const subscriptionId = String(
+    assinatura?.efi_subscription_id || ''
+  ).trim();
+
+  if (!subscriptionId || !assinatura?.id) {
+    return 0;
+  }
+
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+
+  const payload = removerCamposUndefined({
+    assinatura_id:
+      normalizarUuidOuNull(assinatura.id) || undefined,
+    usuario_id:
+      normalizarUuidOuNull(assinatura.usuario_id) || undefined,
+    plano_id:
+      normalizarUuidOuNull(assinatura.plano_id) || undefined,
+    efi_plan_id:
+      assinatura.efi_plan_id
+        ? String(assinatura.efi_plan_id)
+        : undefined,
+  });
+
+  const response = await requisicaoSupabaseInterna({
+    method: 'PATCH',
+    url: `${supabaseUrl}/rest/v1/tab_pagamentos_recorrentes`,
+    params: {
+      efi_subscription_id: `eq.${subscriptionId}`,
+      assinatura_id: 'is.null',
+    },
+    headers: {
+      Prefer: 'return=representation',
+    },
+    data: payload,
+    timeout: 30000,
+  });
+
+  const atualizados = Array.isArray(response.data)
+    ? response.data.length
+    : 0;
+
+  if (atualizados > 0) {
+    console.log(
+      `>>> ${atualizados} pagamento(s) recorrente(s) órfão(s) vinculados à assinatura ${subscriptionId}.`
+    );
+  }
+
+  return atualizados;
+}
 
 // ============================================================
 // SUPABASE - HISTÓRICO DE PAGAMENTOS RECORRENTES
@@ -4635,6 +4695,21 @@ app.post(
           console.log(
             '>>> Assinatura registrada em tab_assinaturas.'
           );
+
+          // Se o webhook chegou antes da gravação do contrato,
+          // completa agora as referências do histórico recorrente órfão.
+          if (registroAssinaturaSalvo) {
+            try {
+              await vincularPagamentosRecorrentesOrfaosAssinatura(
+                registroAssinatura
+              );
+            } catch (erroVinculoOrfaos) {
+              console.error(
+                '>>> Falha ao vincular pagamentos recorrentes órfãos após salvar a assinatura:',
+                resumirErroSeguro(erroVinculoOrfaos)
+              );
+            }
+          }
 
           // ----------------------------------------------------
           // HISTÓRICO FINANCEIRO DA PRIMEIRA COBRANÇA RECORRENTE

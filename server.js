@@ -1,7 +1,7 @@
 // ============================================================
 // ACHE OBRA - BACKEND EFÍ COM LOGS SEGUROS DE TRANSAÇÕES
 // Gerado a partir do server.js fornecido pelo usuário.
-// A lógica financeira original foi preservada.
+// Revisão: histórico de pendências e confirmação financeira definitiva.
 // ============================================================
 
 const express = require('express');
@@ -1792,15 +1792,12 @@ async function aplicarEventoNotificacaoEfi(
  
   if (tipo === 'subscription') {
     if (statusAtual === 'active') {
-      atualizacao.status_assinatura =
-        'ativo';
- 
-      atualizacao.data_inicio_inadimplencia =
-        null;
- 
-      atualizacao.data_fim_carencia =
-        null;
- 
+      // A assinatura existe/está ativa, mas o pagamento pode estar pendente.
+      if (!assinatura.data_ultimo_pagamento) {
+        atualizacao.status_assinatura =
+          'pagamento_pendente';
+      }
+
       atualizacao.cancelado_em =
         null;
     }
@@ -1819,8 +1816,18 @@ async function aplicarEventoNotificacaoEfi(
  
   if (tipo === 'subscription_charge') {
     if (
-      statusAtual === 'paid' ||
+      statusAtual === 'waiting' ||
+      statusAtual === 'pending' ||
       statusAtual === 'approved' ||
+      statusAtual === 'authorized' ||
+      statusAtual === 'new'
+    ) {
+      atualizacao.status_assinatura =
+        'pagamento_pendente';
+    }
+
+    if (
+      statusAtual === 'paid' ||
       statusAtual === 'settled'
     ) {
       atualizacao.status_assinatura =
@@ -3244,41 +3251,80 @@ app.post(
         );
       }
  
-      const aprovado =
-        status ===
-          'approved' ||
-        status ===
-          'paid';
+      // CONFIRMAÇÃO DEFINITIVA + HISTÓRICO DO CARTÃO AVULSO
+      const statusNormalizado =
+        String(status || '').trim().toLowerCase();
+
+      const pagamentoConfirmado =
+        statusNormalizado === 'paid' ||
+        statusNormalizado === 'settled';
+
+      const statusLocal =
+        pagamentoConfirmado
+          ? 'pago'
+          : (
+              statusNormalizado === 'refused' ||
+              statusNormalizado === 'declined' ||
+              statusNormalizado === 'canceled' ||
+              statusNormalizado === 'cancelled'
+                ? 'recusado'
+                : 'aguardando_pagamento'
+            );
 
       let pagamentoAvulsoSalvo = null;
       let erroRegistroPagamentoAvulso = null;
 
-      if (
-        aprovado &&
-        usuario_id &&
-        chargeId
-      ) {
+      if (usuario_id && chargeId) {
         try {
-          pagamentoAvulsoSalvo =
-            await inserirPagamentoAvulsoSupabase({
-              usuario_id: String(usuario_id),
-              origem_tipo: origem_tipo ? String(origem_tipo) : null,
-              origem_id: normalizarUuidOuNull(origem_id),
-              tipo_pagamento: 'cartao',
-              valor: valorNumerico,
-              efi_charge_id: String(chargeId),
-              pix_txid: null,
-              pix_e2e_id: null,
-              status: 'pago',
-              data_pagamento: new Date().toISOString(),
-              estorno_solicitado_em: null,
-              estorno_concluido_em: null,
-              motivo_cancelamento: null,
-            });
+          const existente =
+            await buscarPagamentoAvulsoCartaoPorChargeId(
+              String(chargeId)
+            );
+
+          if (existente?.id) {
+            pagamentoAvulsoSalvo =
+              await atualizarPagamentoAvulsoPorId(
+                existente.id,
+                {
+                  status: statusLocal,
+                  data_pagamento:
+                    pagamentoConfirmado
+                      ? (
+                          existente.data_pagamento ||
+                          new Date().toISOString()
+                        )
+                      : null,
+                }
+              );
+          } else {
+            pagamentoAvulsoSalvo =
+              await inserirPagamentoAvulsoSupabase({
+                usuario_id: String(usuario_id),
+                origem_tipo: origem_tipo ? String(origem_tipo) : null,
+                origem_id: normalizarUuidOuNull(origem_id),
+                tipo_pagamento: 'cartao',
+                valor: valorNumerico,
+                efi_charge_id: String(chargeId),
+                pix_txid: null,
+                pix_e2e_id: null,
+                status: statusLocal,
+                data_pagamento:
+                  pagamentoConfirmado
+                    ? new Date().toISOString()
+                    : null,
+                estorno_solicitado_em: null,
+                estorno_concluido_em: null,
+                motivo_cancelamento: null,
+              });
+          }
 
           console.log(
-            '>>> Pagamento avulso registrado no Supabase:',
-            pagamentoAvulsoSalvo?.id || 'ID não retornado'
+            '>>> Histórico cartão salvo:',
+            pagamentoAvulsoSalvo?.id || 'ID não retornado',
+            '| local:',
+            statusLocal,
+            '| Efí:',
+            statusNormalizado || 'não informado'
           );
         } catch (erroRegistroPagamento) {
           erroRegistroPagamentoAvulso =
@@ -3286,10 +3332,13 @@ app.post(
             erroRegistroPagamento.message;
 
           console.error(
-            '>>> Cobrança aprovada na Efí, mas falhou ao registrar em tab_pagamentos_avulsos:',
+            '>>> Charge criada na Efí, mas falhou o histórico no Supabase:',
             resumirErroSeguro(erroRegistroPagamentoAvulso)
           );
         }
+      } else {
+        erroRegistroPagamentoAvulso =
+          'usuario_id ou charge_id ausente.';
       }
 
  
@@ -3835,9 +3884,21 @@ app.post(
         );
       }
  
+      const statusAssinaturaEfi =
+        String(status || '').trim().toLowerCase();
+
+      const statusPrimeiraCobranca =
+        String(charge?.status || '').trim().toLowerCase();
+
+      const pagamentoConfirmado =
+        statusPrimeiraCobranca === 'paid' ||
+        statusPrimeiraCobranca === 'settled';
+
+      // "active" sozinho não confirma pagamento.
       const assinaturaAtiva =
-        status ===
-        'active';
+        statusAssinaturaEfi === 'active' &&
+        pagamentoConfirmado;
+
  
       // --------------------------------------------------------
       // REGISTRA / ATUALIZA A ASSINATURA NO SUPABASE
@@ -3876,7 +3937,7 @@ app.post(
                 : null,
  
             status_assinatura:
-              assinaturaAtiva
+              pagamentoConfirmado
                 ? 'ativo'
                 : 'pagamento_pendente',
  
@@ -3892,10 +3953,7 @@ app.post(
               new Date().toISOString(),
  
             data_ultimo_pagamento:
-              (
-                charge?.status === 'paid' ||
-                charge?.status === 'approved'
-              )
+              pagamentoConfirmado
                 ? new Date().toISOString()
                 : null,
  
@@ -3945,6 +4003,24 @@ app.post(
         );
       }
  
+      if (subscriptionId && !registroAssinaturaSalvo) {
+        return res
+          .status(502)
+          .json({
+            success: false,
+            approved: false,
+            pago: false,
+            pagamento_confirmado: false,
+            pagamento_pendente: true,
+            status: status || null,
+            subscription_id: subscriptionId,
+            charge: charge,
+            registro_assinatura_salvo: false,
+            error:
+              'A assinatura foi criada na Efí, mas o histórico não pôde ser salvo no banco. O plano não foi liberado.',
+          });
+      }
+
       return res
         .status(201)
         .json({
@@ -3952,10 +4028,10 @@ app.post(
             true,
  
           approved:
-            assinaturaAtiva,
+            pagamentoConfirmado,
  
           pago:
-            assinaturaAtiva,
+            pagamentoConfirmado,
  
           status:
             status,
@@ -4450,6 +4526,88 @@ app.post(
           'A Efí criou a cobrança, mas não retornou subscription_id da nova assinatura.'
         );
       }
+
+      const novoStatusCharge =
+        String(novaCharge?.status || '').trim().toLowerCase();
+
+      const novoPagamentoConfirmado =
+        novoStatusCharge === 'paid' ||
+        novoStatusCharge === 'settled';
+
+      const agoraNovaTentativa =
+        new Date().toISOString();
+
+      // Salva a tentativa imediatamente, mesmo aguardando.
+      const registroPendenteNova =
+        await inserirOuAtualizarAssinaturaSupabase({
+          usuario_id: String(usuario.id),
+          plano_id: novoPlanoId,
+          efi_subscription_id: novaSubscriptionId,
+          efi_plan_id: novoPlanIdEfi,
+          efi_charge_id:
+            novaCharge?.charge_id
+              ? String(novaCharge.charge_id)
+              : null,
+          status_assinatura:
+            novoPagamentoConfirmado
+              ? 'ativo'
+              : 'pagamento_pendente',
+          ultimo_status_efi:
+            novoStatusCharge ||
+            novoStatusEfi ||
+            null,
+          valor_recorrente: novoValor,
+          data_inicio: agoraNovaTentativa,
+          data_ultimo_pagamento:
+            novoPagamentoConfirmado
+              ? agoraNovaTentativa
+              : null,
+          proxima_cobranca_em:
+            normalizarDataIso(
+              novaAssinaturaEfi.next_execution
+            ),
+          data_inicio_inadimplencia: null,
+          data_fim_carencia: null,
+          cancelado_em: null,
+          motivo_cancelamento: null,
+        });
+
+      novaAssinaturaSalva =
+        Boolean(registroPendenteNova);
+
+      if (!novaAssinaturaSalva) {
+        throw new Error(
+          'A nova assinatura foi criada na Efí, mas não foi possível salvar o histórico no Supabase.'
+        );
+      }
+
+      // Enquanto a primeira cobrança estiver aguardando, mantém o
+      // plano recorrente anterior e NÃO informa sucesso ao Flutter.
+      if (!novoPagamentoConfirmado) {
+        return res
+          .status(202)
+          .json({
+            success: true,
+            approved: false,
+            pago: false,
+            pagamento_confirmado: false,
+            pagamento_pendente: true,
+            troca_plano: false,
+            assinatura_anterior_preservada: true,
+            plano_novo_id: novoPlanoId,
+            nova_subscription_id: novaSubscriptionId,
+            charge_id:
+              novaCharge?.charge_id || null,
+            status_nova_assinatura:
+              novoStatusEfi || null,
+            status_primeira_cobranca:
+              novoStatusCharge || null,
+            registro_assinatura_salvo: true,
+            message:
+              'Nova assinatura registrada como pendente. O plano anterior permanece ativo até a confirmação real do pagamento.',
+          });
+      }
+
 
       if (novoStatusEfi !== 'active') {
         // Se por algum motivo a API retornar assinatura não ativa,

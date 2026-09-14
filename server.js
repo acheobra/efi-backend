@@ -1,7 +1,7 @@
 // ============================================================
 // ACHE OBRA - BACKEND EFÍ COM LOGS SEGUROS DE TRANSAÇÕES
 // Gerado a partir do server.js fornecido pelo usuário.
-// Revisão: histórico de pendências, confirmação financeira definitiva e diagnóstico seguro de charge.
+// Revisão: histórico completo de cobranças recorrentes, pendências, confirmação financeira definitiva e diagnóstico seguro de charge.
 // ============================================================
 
 const express = require('express');
@@ -301,7 +301,8 @@ caminho === '/webhook/efi' ||
     caminho === '/cancelar-pagamento-cartao' ||
     caminho === '/cancelar-assinatura' ||
     caminho === '/processar-inadimplencia' ||
-    caminho === '/registrar-assinatura-existente'
+    caminho === '/registrar-assinatura-existente' ||
+    caminho.startsWith('/sincronizar-pagamentos-recorrentes/')
   );
 }
 
@@ -1467,6 +1468,571 @@ async function buscarAssinaturaAtivaPorUsuario(
  
 
 // ============================================================
+// SUPABASE - HISTÓRICO DE PAGAMENTOS RECORRENTES
+// ============================================================
+//
+// tab_assinaturas:
+//   representa o contrato/estado atual da assinatura.
+//
+// tab_pagamentos_recorrentes:
+//   representa CADA cobrança individual gerada pela assinatura.
+//
+// Regra principal:
+// - efi_charge_id é a chave única de conciliação;
+// - o mesmo webhook pode chegar mais de uma vez sem duplicar linhas;
+// - waiting/pending/approved/authorized NÃO são pagamento confirmado;
+// - paid/settled confirmam pagamento;
+// - um evento antigo/intermediário nunca rebaixa uma cobrança já paga;
+// - refunded/estornado pode substituir pago.
+// ============================================================
+
+function normalizarStatusPagamentoRecorrente(statusEfi) {
+  const status = String(statusEfi || '')
+    .trim()
+    .toLowerCase();
+
+  if (status === 'paid' || status === 'settled') {
+    return 'pago';
+  }
+
+  if (status === 'refunded') {
+    return 'estornado';
+  }
+
+  if (
+    status === 'refused' ||
+    status === 'declined' ||
+    status === 'denied'
+  ) {
+    return 'recusado';
+  }
+
+  if (
+    status === 'canceled' ||
+    status === 'cancelled'
+  ) {
+    return 'cancelado';
+  }
+
+  if (status === 'expired') {
+    return 'expirado';
+  }
+
+  if (status === 'unpaid') {
+    return 'nao_pago';
+  }
+
+  return 'aguardando_pagamento';
+}
+
+function statusPagamentoRecorrenteEhPago(statusEfi) {
+  const status = String(statusEfi || '')
+    .trim()
+    .toLowerCase();
+
+  return status === 'paid' || status === 'settled';
+}
+
+function statusPagamentoRecorrenteEhRecusado(statusEfi) {
+  const status = String(statusEfi || '')
+    .trim()
+    .toLowerCase();
+
+  return (
+    status === 'refused' ||
+    status === 'declined' ||
+    status === 'denied'
+  );
+}
+
+function statusPagamentoRecorrenteEhCancelado(statusEfi) {
+  const status = String(statusEfi || '')
+    .trim()
+    .toLowerCase();
+
+  return status === 'canceled' || status === 'cancelled';
+}
+
+function statusPagamentoRecorrenteEhEstornado(statusEfi) {
+  return String(statusEfi || '')
+    .trim()
+    .toLowerCase() === 'refunded';
+}
+
+function removerCamposUndefined(objeto) {
+  return Object.fromEntries(
+    Object.entries(objeto || {})
+      .filter(([, valor]) => valor !== undefined)
+  );
+}
+
+async function buscarPagamentoRecorrentePorChargeId(chargeId) {
+  const id = String(chargeId || '').trim();
+
+  if (!id) {
+    return null;
+  }
+
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+
+  const response = await requisicaoSupabaseInterna({
+    method: 'GET',
+    url: `${supabaseUrl}/rest/v1/tab_pagamentos_recorrentes`,
+    params: {
+      select: '*',
+      efi_charge_id: `eq.${id}`,
+      limit: 1,
+    },
+    timeout: 30000,
+  });
+
+  return Array.isArray(response.data)
+    ? response.data[0] || null
+    : null;
+}
+
+function preservarStatusFinalPagamentoRecorrente(
+  registroExistente,
+  statusLocalNovo,
+  statusEfiNovo
+) {
+  const statusExistente = String(
+    registroExistente?.status || ''
+  )
+    .trim()
+    .toLowerCase();
+
+  const statusEfi = String(statusEfiNovo || '')
+    .trim()
+    .toLowerCase();
+
+  // Estorno é o estado financeiro mais forte.
+  if (statusExistente === 'estornado') {
+    return 'estornado';
+  }
+
+  if (statusPagamentoRecorrenteEhEstornado(statusEfi)) {
+    return 'estornado';
+  }
+
+  // Não permite que webhook atrasado "waiting", "unpaid",
+  // "approved" etc. rebaixe uma cobrança já confirmada.
+  if (statusExistente === 'pago') {
+    return 'pago';
+  }
+
+  return statusLocalNovo;
+}
+
+async function inserirOuAtualizarPagamentoRecorrenteSupabase(dados) {
+  const chargeId = String(
+    dados?.efi_charge_id || ''
+  ).trim();
+
+  if (!chargeId) {
+    throw new Error(
+      'efi_charge_id é obrigatório para registrar pagamento recorrente.'
+    );
+  }
+
+  const existente =
+    await buscarPagamentoRecorrentePorChargeId(chargeId);
+
+  const statusLocalNovo =
+    normalizarStatusPagamentoRecorrente(
+      dados?.status_efi || dados?.status
+    );
+
+  const statusFinal =
+    preservarStatusFinalPagamentoRecorrente(
+      existente,
+      statusLocalNovo,
+      dados?.status_efi
+    );
+
+  const payload = removerCamposUndefined({
+    ...dados,
+    efi_charge_id: chargeId,
+    status: statusFinal,
+
+    // Nunca perde datas financeiras já conhecidas quando o evento
+    // atual não traz novamente essas informações.
+    data_cobranca:
+      dados?.data_cobranca !== undefined
+        ? dados.data_cobranca
+        : existente?.data_cobranca,
+
+    data_pagamento:
+      dados?.data_pagamento !== undefined
+        ? dados.data_pagamento
+        : existente?.data_pagamento,
+
+    data_recusa:
+      dados?.data_recusa !== undefined
+        ? dados.data_recusa
+        : existente?.data_recusa,
+
+    data_cancelamento:
+      dados?.data_cancelamento !== undefined
+        ? dados.data_cancelamento
+        : existente?.data_cancelamento,
+
+    data_estorno:
+      dados?.data_estorno !== undefined
+        ? dados.data_estorno
+        : existente?.data_estorno,
+
+    origem_registro:
+      existente?.origem_registro ||
+      dados?.origem_registro,
+  });
+
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+
+  const response = await requisicaoSupabaseInterna({
+    method: 'POST',
+    url: `${supabaseUrl}/rest/v1/tab_pagamentos_recorrentes`,
+    params: {
+      on_conflict: 'efi_charge_id',
+    },
+    headers: {
+      Prefer:
+        'resolution=merge-duplicates,return=representation',
+    },
+    data: payload,
+    timeout: 30000,
+  });
+
+  return Array.isArray(response.data)
+    ? response.data[0] || null
+    : null;
+}
+
+async function registrarHistoricoPagamentoRecorrente({
+  assinatura = null,
+  assinaturaId = null,
+  usuarioId = null,
+  planoId = null,
+  efiSubscriptionId,
+  efiPlanId = null,
+  chargeId,
+  statusEfi,
+  valor = null,
+  valorCentavosEvento = null,
+  parcelas = null,
+  valorParcela = null,
+  metodoPagamento = 'credit_card',
+  bandeiraCartao = null,
+  dataCobranca = null,
+  dataPagamento = null,
+  dataVencimento = null,
+  notificationToken = null,
+  tipoEvento = null,
+  origemRegistro = null,
+  codigoRecusa = null,
+  motivoRecusa = null,
+  motivoCancelamento = null,
+  valorEstornado = null,
+  observacao = null,
+}) {
+  const idCharge = String(chargeId || '').trim();
+
+  if (!idCharge) {
+    return null;
+  }
+
+  const statusOriginal = String(statusEfi || '')
+    .trim()
+    .toLowerCase();
+
+  const agora = new Date().toISOString();
+
+  const temValorEvento =
+    valorCentavosEvento !== null &&
+    valorCentavosEvento !== undefined &&
+    String(valorCentavosEvento).trim() !== '';
+
+  const valorEventoNumero =
+    temValorEvento
+      ? Number(valorCentavosEvento)
+      : NaN;
+
+  const temValorNormal =
+    valor !== null &&
+    valor !== undefined &&
+    String(valor).trim() !== '';
+
+  const valorNormal =
+    temValorNormal
+      ? Number(valor)
+      : NaN;
+
+  const valorFinal =
+    Number.isFinite(valorEventoNumero) &&
+    valorEventoNumero > 0
+      ? valorEventoNumero / 100
+      : (
+          Number.isFinite(valorNormal) &&
+          valorNormal >= 0
+            ? valorNormal
+            : undefined
+        );
+
+  const pago =
+    statusPagamentoRecorrenteEhPago(statusOriginal);
+
+  const recusado =
+    statusPagamentoRecorrenteEhRecusado(statusOriginal);
+
+  const cancelado =
+    statusPagamentoRecorrenteEhCancelado(statusOriginal);
+
+  const estornado =
+    statusPagamentoRecorrenteEhEstornado(statusOriginal);
+
+  const registro =
+    await inserirOuAtualizarPagamentoRecorrenteSupabase({
+      assinatura_id:
+        normalizarUuidOuNull(
+          assinaturaId || assinatura?.id
+        ) || undefined,
+
+      usuario_id:
+        normalizarUuidOuNull(
+          usuarioId || assinatura?.usuario_id
+        ) || undefined,
+
+      plano_id:
+        normalizarUuidOuNull(
+          planoId || assinatura?.plano_id
+        ) || undefined,
+
+      efi_subscription_id:
+        efiSubscriptionId
+          ? String(efiSubscriptionId)
+          : (
+              assinatura?.efi_subscription_id
+                ? String(assinatura.efi_subscription_id)
+                : undefined
+            ),
+
+      efi_plan_id:
+        efiPlanId
+          ? String(efiPlanId)
+          : (
+              assinatura?.efi_plan_id
+                ? String(assinatura.efi_plan_id)
+                : undefined
+            ),
+
+      efi_charge_id:
+        idCharge,
+
+      valor:
+        valorFinal,
+
+      parcelas:
+        Number.isInteger(Number(parcelas)) &&
+        Number(parcelas) > 0
+          ? Number(parcelas)
+          : undefined,
+
+      valor_parcela:
+        valorParcela !== null &&
+        valorParcela !== undefined &&
+        String(valorParcela).trim() !== '' &&
+        Number.isFinite(Number(valorParcela)) &&
+        Number(valorParcela) >= 0
+          ? Number(valorParcela)
+          : undefined,
+
+      status_efi:
+        statusOriginal || undefined,
+
+      metodo_pagamento:
+        metodoPagamento || undefined,
+
+      bandeira_cartao:
+        bandeiraCartao || undefined,
+
+      data_cobranca:
+        normalizarDataIso(dataCobranca) || undefined,
+
+      data_vencimento:
+        normalizarDataIso(dataVencimento) || undefined,
+
+      data_pagamento:
+        pago
+          ? (
+              normalizarDataIso(dataPagamento) ||
+              agora
+            )
+          : undefined,
+
+      data_recusa:
+        recusado
+          ? agora
+          : undefined,
+
+      data_cancelamento:
+        cancelado
+          ? agora
+          : undefined,
+
+      data_estorno:
+        estornado
+          ? agora
+          : undefined,
+
+      codigo_recusa:
+        codigoRecusa || undefined,
+
+      motivo_recusa:
+        motivoRecusa || undefined,
+
+      motivo_cancelamento:
+        motivoCancelamento || undefined,
+
+      valor_estornado:
+        valorEstornado !== null &&
+        valorEstornado !== undefined &&
+        String(valorEstornado).trim() !== '' &&
+        Number.isFinite(Number(valorEstornado)) &&
+        Number(valorEstornado) >= 0
+          ? Number(valorEstornado)
+          : undefined,
+
+      ultimo_notification_token:
+        notificationToken || undefined,
+
+      ultima_notificacao_efi_em:
+        notificationToken
+          ? agora
+          : undefined,
+
+      ultimo_evento_efi:
+        tipoEvento || undefined,
+
+      ultima_sincronizacao_em:
+        origemRegistro === 'sincronizacao_assinatura'
+          ? agora
+          : undefined,
+
+      origem_registro:
+        origemRegistro || undefined,
+
+      observacao:
+        observacao || undefined,
+    });
+
+  console.log(
+    `>>> Histórico recorrente conciliado. Charge ${idCharge}. Status: ${statusOriginal || 'desconhecido'}.`
+  );
+
+  return registro;
+}
+
+async function consultarAssinaturaEfiPorId(
+  accessToken,
+  subscriptionId
+) {
+  const response = await axios({
+    method: 'GET',
+    url:
+      `${EFI_COBRANCA_API_URL}/subscription/${encodeURIComponent(
+        String(subscriptionId)
+      )}`,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    httpsAgent,
+    timeout: 30000,
+  });
+
+  return response.data?.data || {};
+}
+
+async function sincronizarHistoricoPagamentosRecorrentesAssinatura(
+  subscriptionId,
+  accessTokenInformado = null
+) {
+  const id = String(subscriptionId || '').trim();
+
+  if (!id) {
+    throw new Error(
+      'subscription_id é obrigatório para sincronizar o histórico recorrente.'
+    );
+  }
+
+  const accessToken =
+    accessTokenInformado ||
+    await obterTokenCobranca();
+
+  const assinaturaEfi =
+    await consultarAssinaturaEfiPorId(
+      accessToken,
+      id
+    );
+
+  const assinaturaLocal =
+    await buscarAssinaturaPorSubscriptionId(id);
+
+  const historico = Array.isArray(assinaturaEfi?.history)
+    ? assinaturaEfi.history
+    : [];
+
+  let processados = 0;
+
+  for (const item of historico) {
+    const chargeId = item?.charge_id;
+
+    if (!chargeId) {
+      continue;
+    }
+
+    await registrarHistoricoPagamentoRecorrente({
+      assinatura: assinaturaLocal,
+      efiSubscriptionId: id,
+      efiPlanId:
+        assinaturaEfi?.plan?.plan_id ||
+        assinaturaLocal?.efi_plan_id ||
+        null,
+      chargeId,
+      statusEfi: item?.status,
+      valor:
+        assinaturaLocal?.valor_recorrente ??
+        (
+          Number.isFinite(Number(assinaturaEfi?.value))
+            ? Number(assinaturaEfi.value) / 100
+            : null
+        ),
+      metodoPagamento:
+        assinaturaEfi?.payment_method ||
+        'credit_card',
+      dataCobranca:
+        item?.created_at ||
+        assinaturaEfi?.created_at ||
+        null,
+      origemRegistro:
+        'sincronizacao_assinatura',
+      tipoEvento:
+        'subscription_history',
+    });
+
+    processados++;
+  }
+
+  return {
+    subscription_id: id,
+    total_historico_efi: historico.length,
+    cobranças_processadas: processados,
+    assinatura_local_encontrada:
+      Boolean(assinaturaLocal),
+  };
+}
+
+// ============================================================
 // SUPABASE / EFÍ - AUXILIARES PARA TROCA DE PLANO RECORRENTE
 // ============================================================
 
@@ -1763,18 +2329,95 @@ async function aplicarEventoNotificacaoEfi(
     console.warn(
       `>>> Webhook Efí: assinatura ${subscriptionId} ainda não existe em tab_assinaturas.`
     );
+
+    // Mesmo em uma corrida de eventos (webhook chegando antes do
+    // INSERT da assinatura), preservamos a cobrança pelo charge_id.
+    // Os vínculos usuario/plano podem ser preenchidos depois pela
+    // sincronização da assinatura sem criar duplicidade.
+    let historicoMinimoRegistrado = false;
+
+    if (tipo === 'subscription_charge' && chargeId) {
+      await registrarHistoricoPagamentoRecorrente({
+        efiSubscriptionId:
+          String(subscriptionId),
+        chargeId:
+          String(chargeId),
+        statusEfi:
+          statusAtual || null,
+        valorCentavosEvento:
+          evento?.value ?? null,
+        metodoPagamento:
+          'credit_card',
+        dataCobranca:
+          evento?.created_at || null,
+        dataPagamento:
+          evento?.received_by_bank_at || null,
+        notificationToken:
+          notificationToken,
+        tipoEvento:
+          tipo,
+        origemRegistro:
+          'webhook_antes_assinatura',
+      });
+
+      historicoMinimoRegistrado = true;
+    }
  
     return {
       ignorado: true,
       motivo: 'assinatura_nao_encontrada',
       subscription_id:
         String(subscriptionId),
+      charge_id:
+        chargeId
+          ? String(chargeId)
+          : null,
+      historico_recorrente_registrado:
+        historicoMinimoRegistrado,
     };
   }
  
   const agora =
     new Date();
  
+  // ----------------------------------------------------------
+  // HISTÓRICO FINANCEIRO RECORRENTE
+  // ----------------------------------------------------------
+  // Toda mudança de uma subscription_charge é conciliada pelo
+  // efi_charge_id. O UNIQUE + upsert impede duplicidade.
+  // ----------------------------------------------------------
+
+  if (tipo === 'subscription_charge' && chargeId) {
+    await registrarHistoricoPagamentoRecorrente({
+      assinatura:
+        assinatura,
+      efiSubscriptionId:
+        String(subscriptionId),
+      efiPlanId:
+        assinatura.efi_plan_id || null,
+      chargeId:
+        String(chargeId),
+      statusEfi:
+        statusAtual || null,
+      valor:
+        assinatura.valor_recorrente,
+      valorCentavosEvento:
+        evento?.value ?? null,
+      metodoPagamento:
+        'credit_card',
+      dataCobranca:
+        evento?.created_at || null,
+      dataPagamento:
+        evento?.received_by_bank_at || null,
+      notificationToken:
+        notificationToken,
+      tipoEvento:
+        tipo,
+      origemRegistro:
+        'webhook',
+    });
+  }
+
   const atualizacao = {
     ultimo_status_efi:
       statusAtual || null,
@@ -3907,6 +4550,15 @@ app.post(
  
       let registroAssinaturaSalvo =
         false;
+
+      let registroAssinatura =
+        null;
+
+      let registroPagamentoRecorrenteSalvo =
+        false;
+
+      let erroRegistroPagamentoRecorrente =
+        null;
  
       let erroRegistroAssinatura =
         null;
@@ -3917,7 +4569,8 @@ app.post(
           usuario_id &&
           origem_id
         ) {
-          await inserirOuAtualizarAssinaturaSupabase({
+          registroAssinatura =
+            await inserirOuAtualizarAssinaturaSupabase({
             usuario_id:
               String(usuario_id),
  
@@ -3977,11 +4630,111 @@ app.post(
           });
  
           registroAssinaturaSalvo =
-            true;
+            Boolean(registroAssinatura);
  
           console.log(
             '>>> Assinatura registrada em tab_assinaturas.'
           );
+
+          // ----------------------------------------------------
+          // HISTÓRICO FINANCEIRO DA PRIMEIRA COBRANÇA RECORRENTE
+          // ----------------------------------------------------
+          // A cobrança entra em tab_pagamentos_recorrentes assim
+          // que possui charge_id, mesmo em waiting/pending.
+          // ----------------------------------------------------
+
+          if (charge?.charge_id) {
+            try {
+              const registroPagamento =
+                await registrarHistoricoPagamentoRecorrente({
+                  assinatura:
+                    registroAssinatura,
+                  usuarioId:
+                    String(usuario_id),
+                  planoId:
+                    String(origem_id),
+                  efiSubscriptionId:
+                    String(subscriptionId),
+                  efiPlanId:
+                    String(planIdEfi),
+                  chargeId:
+                    String(charge.charge_id),
+                  statusEfi:
+                    charge?.status || status || null,
+                  valor:
+                    valorNumerico,
+                  parcelas:
+                    charge?.installments ||
+                    charge?.parcel ||
+                    null,
+                  valorParcela:
+                    Number.isFinite(Number(charge?.installment_value))
+                      ? Number(charge.installment_value) / 100
+                      : null,
+                  metodoPagamento:
+                    charge?.payment_method ||
+                    'credit_card',
+                  bandeiraCartao:
+                    charge?.card_brand ||
+                    charge?.payment?.credit_card?.brand ||
+                    null,
+                  dataCobranca:
+                    charge?.created_at ||
+                    new Date().toISOString(),
+                  dataPagamento:
+                    charge?.paid_at ||
+                    null,
+                  dataVencimento:
+                    charge?.expire_at ||
+                    null,
+                  codigoRecusa:
+                    charge?.refusal?.code ||
+                    null,
+                  motivoRecusa:
+                    charge?.refusal?.message ||
+                    charge?.refusal?.reason ||
+                    null,
+                  origemRegistro:
+                    'criacao_assinatura',
+                  tipoEvento:
+                    'subscription_charge',
+                });
+
+              registroPagamentoRecorrenteSalvo =
+                Boolean(registroPagamento);
+
+            } catch (erroHistoricoRecorrente) {
+              erroRegistroPagamentoRecorrente =
+                erroHistoricoRecorrente.response?.data ||
+                erroHistoricoRecorrente.message;
+
+              console.error(
+                '>>> Assinatura criada, mas falhou ao salvar a cobrança em tab_pagamentos_recorrentes:',
+                resumirErroSeguro(erroHistoricoRecorrente)
+              );
+
+              // Segurança: se a Efí já confirmou o pagamento, não
+              // deixamos o contrato local como ativo sem o histórico.
+              if (pagamentoConfirmado) {
+                try {
+                  await atualizarAssinaturaPorSubscriptionId(
+                    String(subscriptionId),
+                    {
+                      status_assinatura:
+                        'pagamento_pendente',
+                      data_ultimo_pagamento:
+                        null,
+                    }
+                  );
+                } catch (erroReversaoLocal) {
+                  console.error(
+                    '>>> Falha ao manter a assinatura pendente após erro no histórico recorrente:',
+                    resumirErroSeguro(erroReversaoLocal)
+                  );
+                }
+              }
+            }
+          }
  
         } else {
           erroRegistroAssinatura =
@@ -4004,7 +4757,16 @@ app.post(
         );
       }
  
-      if (subscriptionId && !registroAssinaturaSalvo) {
+      if (
+        subscriptionId &&
+        (
+          !registroAssinaturaSalvo ||
+          (
+            charge?.charge_id &&
+            !registroPagamentoRecorrenteSalvo
+          )
+        )
+      ) {
         return res
           .status(502)
           .json({
@@ -4016,9 +4778,16 @@ app.post(
             status: status || null,
             subscription_id: subscriptionId,
             charge: charge,
-            registro_assinatura_salvo: false,
+            registro_assinatura_salvo:
+              registroAssinaturaSalvo,
+            registro_pagamento_recorrente_salvo:
+              registroPagamentoRecorrenteSalvo,
+            erro_registro_pagamento_recorrente:
+              erroRegistroPagamentoRecorrente,
             error:
-              'A assinatura foi criada na Efí, mas o histórico não pôde ser salvo no banco. O plano não foi liberado.',
+              !registroAssinaturaSalvo
+                ? 'A assinatura foi criada na Efí, mas o contrato não pôde ser salvo em tab_assinaturas. O plano não foi liberado.'
+                : 'A assinatura foi criada na Efí, mas a cobrança não pôde ser salva em tab_pagamentos_recorrentes. O plano não foi liberado.',
           });
       }
 
@@ -4042,9 +4811,17 @@ app.post(
  
           registro_assinatura_salvo:
             registroAssinaturaSalvo,
+
+          registro_pagamento_recorrente_salvo:
+            charge?.charge_id
+              ? registroPagamentoRecorrenteSalvo
+              : null,
  
           erro_registro_assinatura:
             erroRegistroAssinatura,
+
+          erro_registro_pagamento_recorrente:
+            erroRegistroPagamentoRecorrente,
  
           plan_id:
             dadosAssinatura
@@ -4582,6 +5359,120 @@ app.post(
         );
       }
 
+      let registroPagamentoRecorrenteNova = null;
+
+      if (novaCharge?.charge_id) {
+        try {
+          registroPagamentoRecorrenteNova =
+            await registrarHistoricoPagamentoRecorrente({
+              assinatura:
+                registroPendenteNova,
+              usuarioId:
+                String(usuario.id),
+              planoId:
+                novoPlanoId,
+              efiSubscriptionId:
+                novaSubscriptionId,
+              efiPlanId:
+                novoPlanIdEfi,
+              chargeId:
+                String(novaCharge.charge_id),
+              statusEfi:
+                novoStatusCharge ||
+                novoStatusEfi ||
+                null,
+              valor:
+                novoValor,
+              parcelas:
+                novaCharge?.installments ||
+                novaCharge?.parcel ||
+                null,
+              valorParcela:
+                Number.isFinite(Number(novaCharge?.installment_value))
+                  ? Number(novaCharge.installment_value) / 100
+                  : null,
+              metodoPagamento:
+                novaCharge?.payment_method ||
+                'credit_card',
+              bandeiraCartao:
+                novaCharge?.card_brand ||
+                novaCharge?.payment?.credit_card?.brand ||
+                null,
+              dataCobranca:
+                novaCharge?.created_at ||
+                agoraNovaTentativa,
+              dataPagamento:
+                novaCharge?.paid_at ||
+                null,
+              dataVencimento:
+                novaCharge?.expire_at ||
+                null,
+              codigoRecusa:
+                novaCharge?.refusal?.code ||
+                null,
+              motivoRecusa:
+                novaCharge?.refusal?.message ||
+                novaCharge?.refusal?.reason ||
+                null,
+              origemRegistro:
+                'troca_assinatura',
+              tipoEvento:
+                'subscription_charge',
+            });
+
+        } catch (erroHistoricoNova) {
+          console.error(
+            '>>> Falha ao salvar cobrança da nova assinatura em tab_pagamentos_recorrentes. A assinatura anterior será preservada:',
+            resumirErroSeguro(erroHistoricoNova)
+          );
+
+          let novaCanceladaAposErroHistorico = false;
+
+          try {
+            await cancelarAssinaturaEfiPorId(
+              accessToken,
+              novaSubscriptionId
+            );
+
+            novaCanceladaAposErroHistorico = true;
+
+            await atualizarAssinaturaPorSubscriptionId(
+              novaSubscriptionId,
+              {
+                status_assinatura: 'cancelado',
+                ultimo_status_efi: 'canceled',
+                cancelado_em: new Date().toISOString(),
+                motivo_cancelamento:
+                  'Cancelamento compensatório: falha ao registrar histórico financeiro recorrente.',
+              }
+            );
+          } catch (erroCompensacaoHistorico) {
+            console.error(
+              '>>> ATENÇÃO: falhou também o cancelamento compensatório da nova assinatura após erro no histórico:',
+              resumirErroSeguro(erroCompensacaoHistorico)
+            );
+          }
+
+          return res
+            .status(502)
+            .json({
+              success: false,
+              approved: false,
+              pago: false,
+              troca_plano: false,
+              assinatura_anterior_preservada: true,
+              nova_subscription_id:
+                novaSubscriptionId,
+              nova_cancelada_compensacao:
+                novaCanceladaAposErroHistorico,
+              registro_pagamento_recorrente_salvo:
+                false,
+              error:
+                'A nova assinatura foi criada, mas não foi possível registrar sua cobrança recorrente no histórico. A troca não foi concluída.',
+            });
+        }
+      }
+
       // Enquanto a primeira cobrança estiver aguardando, mantém o
       // plano recorrente anterior e NÃO informa sucesso ao Flutter.
       if (!novoPagamentoConfirmado) {
@@ -4604,6 +5495,10 @@ app.post(
             status_primeira_cobranca:
               novoStatusCharge || null,
             registro_assinatura_salvo: true,
+            registro_pagamento_recorrente_salvo:
+              novaCharge?.charge_id
+                ? Boolean(registroPagamentoRecorrenteNova)
+                : null,
             message:
               'Nova assinatura registrada como pendente. O plano anterior permanece ativo até a confirmação real do pagamento.',
           });
@@ -4807,6 +5702,10 @@ app.post(
           },
           registro_assinatura_salvo:
             novaAssinaturaSalva,
+          registro_pagamento_recorrente_salvo:
+            novaCharge?.charge_id
+              ? Boolean(registroPagamentoRecorrenteNova)
+              : null,
           data:
             novaAssinaturaEfi,
         });
@@ -5790,32 +6689,11 @@ app.post(
       const accessToken =
         await obterTokenCobranca();
  
-      const response =
-        await axios({
-          method: 'GET',
- 
-          url:
-            `${EFI_COBRANCA_API_URL}/subscription/${encodeURIComponent(
-              subscriptionId
-            )}`,
- 
-          headers: {
-            Authorization:
-              `Bearer ${accessToken}`,
- 
-            'Content-Type':
-              'application/json',
-          },
- 
-          httpsAgent,
- 
-          timeout:
-            30000,
-        });
- 
       const assinaturaEfi =
-        response.data?.data ||
-        {};
+        await consultarAssinaturaEfiPorId(
+          accessToken,
+          subscriptionId
+        );
  
       // Vincula a URL de webhook também à assinatura antiga.
       await axios({
@@ -5935,10 +6813,41 @@ app.post(
               : null,
         });
  
+      let sincronizacaoHistorico = null;
+
+      try {
+        sincronizacaoHistorico =
+          await sincronizarHistoricoPagamentosRecorrentesAssinatura(
+            subscriptionId,
+            accessToken
+          );
+      } catch (erroSincronizacaoHistorico) {
+        console.error(
+          '>>> Assinatura importada, mas houve erro ao sincronizar o histórico recorrente:',
+          resumirErroSeguro(erroSincronizacaoHistorico)
+        );
+
+        return res
+          .status(502)
+          .json({
+            success: false,
+            assinatura:
+              registro,
+            historico_recorrente_sincronizado:
+              false,
+            error:
+              'A assinatura foi registrada, mas o histórico de cobranças recorrentes não pôde ser sincronizado.',
+          });
+      }
+
       return res.json({
         success: true,
         assinatura:
           registro,
+        historico_recorrente_sincronizado:
+          true,
+        sincronizacao_historico:
+          sincronizacaoHistorico,
       });
  
     } catch (error) {
@@ -5961,6 +6870,80 @@ app.post(
   }
 );
  
+// ============================================================
+// SINCRONIZAÇÃO MANUAL DO HISTÓRICO RECORRENTE
+// ============================================================
+//
+// POST /sincronizar-pagamentos-recorrentes/:subscriptionId
+//
+// Protegida por SYNC_PLANOS_SECRET.
+// Lê GET /v1/subscription/:id na Efí e percorre o history,
+// gravando/atualizando cada charge_id em
+// tab_pagamentos_recorrentes.
+//
+// Útil para:
+// - importar cobranças anteriores à criação da nova tabela;
+// - recuperar eventos perdidos;
+// - conciliar manualmente uma assinatura específica.
+// ============================================================
+
+app.post(
+  '/sincronizar-pagamentos-recorrentes/:subscriptionId',
+
+  async (req, res) => {
+    try {
+      if (!validarSyncSecret(req)) {
+        return res
+          .status(401)
+          .json({
+            success: false,
+            error: 'Não autorizado.',
+          });
+      }
+
+      const subscriptionId = String(
+        req.params?.subscriptionId || ''
+      ).trim();
+
+      if (!subscriptionId) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            error: 'subscriptionId é obrigatório.',
+          });
+      }
+
+      const resultado =
+        await sincronizarHistoricoPagamentosRecorrentesAssinatura(
+          subscriptionId
+        );
+
+      return res.json({
+        success: true,
+        ...resultado,
+      });
+
+    } catch (error) {
+      console.error(
+        '>>> ERRO AO SINCRONIZAR PAGAMENTOS RECORRENTES:',
+        resumirErroSeguro(error)
+      );
+
+      return res
+        .status(
+          error.response?.status ||
+          500
+        )
+        .json({
+          success: false,
+          error:
+            resumirErroSeguro(error),
+        });
+    }
+  }
+);
+
 // ============================================================
 // DIAGNÓSTICO SEGURO DE COBRANÇA EFÍ
 // ============================================================
@@ -6333,6 +7316,9 @@ app.get(
  
         registrar_assinatura_existente:
           '/registrar-assinatura-existente',
+
+        sincronizar_pagamentos_recorrentes:
+          '/sincronizar-pagamentos-recorrentes/:subscriptionId',
       },
     });
   }

@@ -2185,6 +2185,266 @@ async function atualizarAssinaturaPorSubscriptionId(
     : null;
 }
  
+
+// ============================================================
+// TROCA SEGURA - ATIVA NOVA ASSINATURA SOMENTE APÓS PAGAMENTO
+// ============================================================
+//
+// Regra:
+// - pagamento_pendente pode coexistir com a assinatura vigente;
+// - quando a nova cobrança chegar a paid/settled, localiza a
+//   assinatura vigente anterior do mesmo usuário;
+// - cancela a anterior na Efí;
+// - marca a anterior como cancelada no Supabase;
+// - somente então promove a nova para ativo.
+// ============================================================
+
+async function buscarAssinaturaVigenteAnteriorPorUsuario(
+  usuarioId,
+  subscriptionIdExcluir = null
+) {
+  const idUsuario = String(usuarioId || '').trim();
+
+  if (!idUsuario) {
+    return null;
+  }
+
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+
+  const response = await requisicaoSupabaseInterna({
+    method: 'GET',
+    url: `${supabaseUrl}/rest/v1/tab_assinaturas`,
+    params: {
+      select: '*',
+      usuario_id: `eq.${idUsuario}`,
+      status_assinatura: 'in.(ativo,inadimplente)',
+      order: 'created_at.desc',
+      limit: 10,
+    },
+    timeout: 30000,
+  });
+
+  const lista = Array.isArray(response.data)
+    ? response.data
+    : [];
+
+  const excluir = String(subscriptionIdExcluir || '').trim();
+
+  return (
+    lista.find((item) => {
+      const atual = String(item?.efi_subscription_id || '').trim();
+      return !excluir || atual !== excluir;
+    }) || null
+  );
+}
+
+async function cancelarAssinaturaEfiConfirmandoEstado(
+  accessToken,
+  subscriptionId
+) {
+  const id = String(subscriptionId || '').trim();
+
+  if (!id) {
+    return {
+      cancelada: false,
+      motivo: 'subscription_id_ausente',
+    };
+  }
+
+  try {
+    await cancelarAssinaturaEfiPorId(
+      accessToken,
+      id
+    );
+
+    return {
+      cancelada: true,
+      ja_estava_cancelada: false,
+    };
+
+  } catch (erroCancelamento) {
+    try {
+      const assinaturaEfi =
+        await consultarAssinaturaEfiPorId(
+          accessToken,
+          id
+        );
+
+      const statusEfi = String(
+        assinaturaEfi?.status || ''
+      )
+        .trim()
+        .toLowerCase();
+
+      if (
+        statusEfi === 'canceled' ||
+        statusEfi === 'cancelled' ||
+        statusEfi === 'expired'
+      ) {
+        return {
+          cancelada: true,
+          ja_estava_cancelada: true,
+          status_efi: statusEfi,
+        };
+      }
+    } catch (erroConsulta) {
+      console.error(
+        '>>> Falha ao confirmar estado da assinatura antiga após erro de cancelamento:',
+        resumirErroSeguro(erroConsulta)
+      );
+    }
+
+    throw erroCancelamento;
+  }
+}
+
+async function finalizarAtivacaoAssinaturaPaga({
+  assinaturaNova,
+  dataPagamento = null,
+  accessTokenInformado = null,
+  motivoTroca = 'Troca automática após confirmação financeira da nova assinatura.',
+}) {
+  if (!assinaturaNova?.efi_subscription_id) {
+    throw new Error(
+      'Não foi possível finalizar a ativação: nova assinatura sem efi_subscription_id.'
+    );
+  }
+
+  if (!assinaturaNova?.usuario_id) {
+    throw new Error(
+      'Não foi possível finalizar a ativação: nova assinatura sem usuario_id.'
+    );
+  }
+
+  const novaSubscriptionId =
+    String(assinaturaNova.efi_subscription_id).trim();
+
+  const usuarioId =
+    String(assinaturaNova.usuario_id).trim();
+
+  const statusLocalAtual =
+    String(assinaturaNova.status_assinatura || '')
+      .trim()
+      .toLowerCase();
+
+  if (statusLocalAtual === 'ativo') {
+    const atualizada =
+      await atualizarAssinaturaPorSubscriptionId(
+        novaSubscriptionId,
+        {
+          data_ultimo_pagamento:
+            normalizarDataIso(dataPagamento) ||
+            assinaturaNova.data_ultimo_pagamento ||
+            new Date().toISOString(),
+          data_inicio_inadimplencia: null,
+          data_fim_carencia: null,
+        }
+      );
+
+    return {
+      ativada: true,
+      ja_estava_ativa: true,
+      assinatura_nova: atualizada || assinaturaNova,
+      assinatura_anterior: null,
+    };
+  }
+
+  const assinaturaAnterior =
+    await buscarAssinaturaVigenteAnteriorPorUsuario(
+      usuarioId,
+      novaSubscriptionId
+    );
+
+  const agora = new Date().toISOString();
+
+  if (assinaturaAnterior) {
+    const assinaturaAnteriorId = String(
+      assinaturaAnterior.efi_subscription_id || ''
+    ).trim();
+
+    if (!assinaturaAnteriorId) {
+      throw new Error(
+        'Existe assinatura vigente anterior sem efi_subscription_id. A nova não será ativada automaticamente.'
+      );
+    }
+
+    const accessToken =
+      accessTokenInformado ||
+      await obterTokenCobranca();
+
+    console.log(
+      `>>> Nova assinatura ${novaSubscriptionId} paga. Cancelando assinatura anterior ${assinaturaAnteriorId} antes da ativação.`
+    );
+
+    await cancelarAssinaturaEfiConfirmandoEstado(
+      accessToken,
+      assinaturaAnteriorId
+    );
+
+    await atualizarAssinaturaPorSubscriptionId(
+      assinaturaAnteriorId,
+      {
+        status_assinatura: 'cancelado',
+        ultimo_status_efi: 'canceled',
+        cancelado_em: agora,
+        motivo_cancelamento:
+          motivoTroca,
+        data_inicio_inadimplencia: null,
+        data_fim_carencia: null,
+      }
+    );
+
+    console.log(
+      `>>> Assinatura anterior ${assinaturaAnteriorId} cancelada com segurança.`
+    );
+  }
+
+  const assinaturaNovaAtiva =
+    await atualizarAssinaturaPorSubscriptionId(
+      novaSubscriptionId,
+      {
+        status_assinatura: 'ativo',
+        data_ultimo_pagamento:
+          normalizarDataIso(dataPagamento) ||
+          assinaturaNova.data_ultimo_pagamento ||
+          agora,
+        data_inicio_inadimplencia: null,
+        data_fim_carencia: null,
+        cancelado_em: null,
+        motivo_cancelamento: null,
+      }
+    );
+
+  if (!assinaturaNovaAtiva) {
+    throw new Error(
+      'A assinatura anterior foi tratada, mas não foi possível ativar a nova assinatura no Supabase.'
+    );
+  }
+
+  try {
+    await vincularPagamentosRecorrentesOrfaosAssinatura(
+      assinaturaNovaAtiva
+    );
+  } catch (erroVinculo) {
+    console.error(
+      '>>> Nova assinatura ativada, mas falhou a vinculação de pagamentos recorrentes órfãos:',
+      resumirErroSeguro(erroVinculo)
+    );
+  }
+
+  console.log(
+    `>>> Nova assinatura ${novaSubscriptionId} ativada após confirmação financeira.`
+  );
+
+  return {
+    ativada: true,
+    ja_estava_ativa: false,
+    assinatura_nova: assinaturaNovaAtiva,
+    assinatura_anterior: assinaturaAnterior,
+  };
+}
+
+
 async function processarCarenciasVencidas() {
   try {
     const {
@@ -2534,19 +2794,41 @@ async function aplicarEventoNotificacaoEfi(
       statusAtual === 'paid' ||
       statusAtual === 'settled'
     ) {
-      atualizacao.status_assinatura =
-        'ativo';
- 
-      atualizacao.data_ultimo_pagamento =
+      const dataPagamentoConfirmado =
         normalizarDataIso(
           evento?.received_by_bank_at
         ) || agora.toISOString();
- 
+
+      // Antes de promover a nova assinatura para ativo, cancela com
+      // segurança eventual assinatura vigente anterior do usuário.
+      // Isso evita colisão com uq_tab_assinaturas_usuario_ativa.
+      const finalizacao =
+        await finalizarAtivacaoAssinaturaPaga({
+          assinaturaNova:
+            assinatura,
+          dataPagamento:
+            dataPagamentoConfirmado,
+          motivoTroca:
+            `Troca automática confirmada pelo webhook Efí para a assinatura ${String(subscriptionId)}.`,
+        });
+
+      atualizacao.status_assinatura =
+        'ativo';
+
+      atualizacao.data_ultimo_pagamento =
+        dataPagamentoConfirmado;
+
       atualizacao.data_inicio_inadimplencia =
         null;
- 
+
       atualizacao.data_fim_carencia =
         null;
+
+      if (finalizacao?.assinatura_anterior) {
+        console.log(
+          `>>> Webhook concluiu troca segura para ${String(subscriptionId)}.`
+        );
+      }
     }
  
     if (statusAtual === 'unpaid') {
@@ -4650,10 +4932,11 @@ app.post(
                   )
                 : null,
  
+            // Sempre grava primeiro como pendente. A promoção para
+            // ativo ocorre somente após tratar com segurança eventual
+            // assinatura vigente anterior do mesmo usuário.
             status_assinatura:
-              pagamentoConfirmado
-                ? 'ativo'
-                : 'pagamento_pendente',
+              'pagamento_pendente',
  
             ultimo_status_efi:
               charge?.status ||
@@ -4832,6 +5115,64 @@ app.post(
         );
       }
  
+      // --------------------------------------------------------
+      // PROMOÇÃO SEGURA PARA ATIVO APÓS CONFIRMAÇÃO FINANCEIRA
+      // --------------------------------------------------------
+      if (
+        pagamentoConfirmado &&
+        registroAssinaturaSalvo &&
+        (
+          !charge?.charge_id ||
+          registroPagamentoRecorrenteSalvo
+        )
+      ) {
+        try {
+          const finalizacao =
+            await finalizarAtivacaoAssinaturaPaga({
+              assinaturaNova:
+                registroAssinatura,
+              dataPagamento:
+                charge?.paid_at ||
+                new Date().toISOString(),
+              accessTokenInformado:
+                accessToken,
+              motivoTroca:
+                `Troca automática para o plano ${String(origem_id || '')} após confirmação financeira.`,
+            });
+
+          registroAssinatura =
+            finalizacao.assinatura_nova ||
+            registroAssinatura;
+
+        } catch (erroFinalizacaoAtivacao) {
+          console.error(
+            '>>> Pagamento recorrente confirmado, mas a ativação segura não pôde ser concluída:',
+            resumirErroSeguro(erroFinalizacaoAtivacao)
+          );
+
+          return res
+            .status(502)
+            .json({
+              success: false,
+              approved: false,
+              pago: false,
+              pagamento_confirmado: true,
+              pagamento_pendente: true,
+              status: status || null,
+              subscription_id: subscriptionId,
+              charge: charge,
+              registro_assinatura_salvo:
+                registroAssinaturaSalvo,
+              registro_pagamento_recorrente_salvo:
+                charge?.charge_id
+                  ? registroPagamentoRecorrenteSalvo
+                  : null,
+              error:
+                'O pagamento foi confirmado, mas a ativação segura do novo plano ainda não pôde ser concluída. A assinatura anterior foi preservada.',
+            });
+        }
+      }
+
       if (
         subscriptionId &&
         (
@@ -5401,10 +5742,10 @@ app.post(
             novaCharge?.charge_id
               ? String(novaCharge.charge_id)
               : null,
+          // Sempre grava primeiro como pendente. Se o pagamento já
+          // vier confirmado, a antiga será cancelada antes da promoção.
           status_assinatura:
-            novoPagamentoConfirmado
-              ? 'ativo'
-              : 'pagamento_pendente',
+            'pagamento_pendente',
           ultimo_status_efi:
             novoStatusCharge ||
             novoStatusEfi ||
@@ -5714,7 +6055,6 @@ app.post(
           data_ultimo_pagamento:
             (
               novaCharge?.status === 'paid' ||
-              novaCharge?.status === 'approved' ||
               novaCharge?.status === 'settled'
             )
               ? agora

@@ -1,7 +1,7 @@
 // ============================================================
 // ACHE OBRA - BACKEND EFÍ COM LOGS SEGUROS DE TRANSAÇÕES
 // Gerado a partir do server.js fornecido pelo usuário.
-// Revisão: histórico de pendências e confirmação financeira definitiva.
+// Revisão: histórico de pendências, confirmação financeira definitiva e diagnóstico seguro de charge.
 // ============================================================
 
 const express = require('express');
@@ -295,7 +295,8 @@ function rotaFinanceiraParaLog(req) {
     caminho === '/cobrar-cartao' ||
     caminho === '/cobrar-assinatura' ||
     caminho === '/trocar-assinatura' ||
-    caminho === '/webhook/efi' ||
+        caminho.startsWith('/diagnostico-charge/') ||
+caminho === '/webhook/efi' ||
     caminho === '/cancelar-pagamento-pix' ||
     caminho === '/cancelar-pagamento-cartao' ||
     caminho === '/cancelar-assinatura' ||
@@ -5961,6 +5962,320 @@ app.post(
 );
  
 // ============================================================
+// DIAGNÓSTICO SEGURO DE COBRANÇA EFÍ
+// ============================================================
+//
+// GET /diagnostico-charge/:chargeId
+//
+// Segurança:
+// - exige o mesmo SYNC_PLANOS_SECRET das rotas administrativas;
+// - aceita X-Sync-Secret ou Authorization: Bearer <SYNC_PLANOS_SECRET>;
+// - não devolve CPF, e-mail, telefone, cartão, CVV, payment_token,
+//   token OAuth, Client Secret nem o payload bruto da Efí;
+// - retorna somente informações técnicas úteis para diagnóstico.
+//
+// Exemplo:
+// curl -H "X-Sync-Secret: SEU_SYNC_PLANOS_SECRET" \
+//   https://efi-backend-1.onrender.com/diagnostico-charge/45019980
+// ============================================================
+
+function resumirCobrancaEfiParaDiagnostico(respostaEfi) {
+  const raiz =
+    respostaEfi?.data &&
+    typeof respostaEfi.data === 'object'
+      ? respostaEfi.data
+      : (
+          respostaEfi &&
+          typeof respostaEfi === 'object'
+            ? respostaEfi
+            : {}
+        );
+
+  const charge =
+    raiz?.charge &&
+    typeof raiz.charge === 'object'
+      ? raiz.charge
+      : raiz;
+
+  const payment =
+    charge?.payment &&
+    typeof charge.payment === 'object'
+      ? charge.payment
+      : {};
+
+  const refusal =
+    charge?.refusal &&
+    typeof charge.refusal === 'object'
+      ? charge.refusal
+      : (
+          payment?.refusal &&
+          typeof payment.refusal === 'object'
+            ? payment.refusal
+            : {}
+        );
+
+  const historicoBruto =
+    Array.isArray(charge?.history)
+      ? charge.history
+      : (
+          Array.isArray(charge?.status_history)
+            ? charge.status_history
+            : (
+                Array.isArray(charge?.events)
+                  ? charge.events
+                  : []
+              )
+        );
+
+  const historico =
+    historicoBruto
+      .slice(-20)
+      .map((item) => ({
+        type:
+          item?.type
+            ? sanitizarTextoSeguro(item.type)
+            : null,
+
+        status:
+          item?.status
+            ? sanitizarTextoSeguro(
+                typeof item.status === 'object'
+                  ? (
+                      item.status.current ||
+                      item.status.new ||
+                      JSON.stringify(item.status)
+                    )
+                  : item.status
+              )
+            : null,
+
+        created_at:
+          normalizarDataIso(
+            item?.created_at ||
+            item?.date ||
+            item?.timestamp
+          ),
+
+        reason:
+          item?.reason
+            ? sanitizarTextoSeguro(item.reason)
+            : null,
+
+        message:
+          item?.message
+            ? sanitizarTextoSeguro(item.message)
+            : null,
+      }));
+
+  return {
+    charge_id:
+      charge?.charge_id ??
+      charge?.id ??
+      null,
+
+    status:
+      charge?.status
+        ? String(charge.status).trim().toLowerCase()
+        : null,
+
+    total_centavos:
+      Number.isFinite(
+        Number(
+          charge?.total ??
+          charge?.value
+        )
+      )
+        ? Number(
+            charge?.total ??
+            charge?.value
+          )
+        : null,
+
+    installments:
+      charge?.installments ??
+      payment?.installments ??
+      null,
+
+    installment_value:
+      charge?.installment_value ??
+      payment?.installment_value ??
+      null,
+
+    created_at:
+      normalizarDataIso(
+        charge?.created_at
+      ),
+
+    paid_at:
+      normalizarDataIso(
+        charge?.paid_at ||
+        charge?.received_by_bank_at ||
+        payment?.paid_at
+      ),
+
+    payment_method:
+      payment?.method
+        ? sanitizarTextoSeguro(payment.method)
+        : (
+            charge?.payment_method
+              ? sanitizarTextoSeguro(charge.payment_method)
+              : null
+          ),
+
+    card_brand:
+      payment?.brand
+        ? sanitizarTextoSeguro(payment.brand)
+        : (
+            payment?.card_brand
+              ? sanitizarTextoSeguro(payment.card_brand)
+              : null
+          ),
+
+    subscription_id:
+      charge?.subscription_id ??
+      charge?.identifiers?.subscription_id ??
+      raiz?.subscription_id ??
+      null,
+
+    plan_id:
+      charge?.plan_id ??
+      charge?.plan?.plan_id ??
+      raiz?.plan_id ??
+      raiz?.plan?.plan_id ??
+      null,
+
+    refusal:
+      Object.keys(refusal).length > 0
+        ? {
+            reason:
+              refusal?.reason
+                ? sanitizarTextoSeguro(refusal.reason)
+                : null,
+
+            retry:
+              refusal?.retry ?? null,
+
+            code:
+              refusal?.code
+                ? sanitizarTextoSeguro(refusal.code)
+                : null,
+          }
+        : null,
+
+    historico,
+  };
+}
+
+app.get(
+  '/diagnostico-charge/:chargeId',
+
+  async (req, res) => {
+    try {
+      if (!validarSyncSecret(req)) {
+        return res
+          .status(401)
+          .json({
+            success: false,
+            error: 'Não autorizado.',
+          });
+      }
+
+      const chargeId =
+        String(
+          req.params.chargeId || ''
+        ).trim();
+
+      if (!/^\d+$/.test(chargeId)) {
+        return res
+          .status(400)
+          .json({
+            success: false,
+            error: 'charge_id inválido.',
+          });
+      }
+
+      console.log(
+        '>>> DIAGNÓSTICO EFÍ - CONSULTANDO CHARGE:',
+        chargeId
+      );
+
+      const accessToken =
+        await obterTokenCobranca();
+
+      const response =
+        await axios({
+          method: 'GET',
+
+          url:
+            `${EFI_COBRANCA_API_URL}/charge/${encodeURIComponent(
+              chargeId
+            )}`,
+
+          headers: {
+            Authorization:
+              `Bearer ${accessToken}`,
+
+            'Content-Type':
+              'application/json',
+          },
+
+          httpsAgent,
+
+          timeout:
+            30000,
+        });
+
+      const diagnostico =
+        resumirCobrancaEfiParaDiagnostico(
+          response.data
+        );
+
+      console.log(
+        '>>> DIAGNÓSTICO EFÍ CONCLUÍDO:',
+        {
+          charge_id:
+            diagnostico.charge_id ||
+            chargeId,
+
+          status:
+            diagnostico.status,
+
+          subscription_id:
+            diagnostico.subscription_id,
+
+          refusal:
+            diagnostico.refusal,
+        }
+      );
+
+      return res.json({
+        success: true,
+        ambiente: 'homologacao',
+        charge_id: chargeId,
+        diagnostico,
+      });
+
+    } catch (error) {
+      console.error(
+        '>>> ERRO NO DIAGNÓSTICO DA CHARGE EFÍ:',
+        resumirErroSeguro(error)
+      );
+
+      return res
+        .status(
+          error.response?.status ||
+          500
+        )
+        .json({
+          success: false,
+          error:
+            resumirErroSeguro(error),
+        });
+    }
+  }
+);
+
+// ============================================================
 // ROTA DE TESTE
 // ============================================================
  
@@ -5997,6 +6312,9 @@ app.get(
 
         trocar_assinatura:
           '/trocar-assinatura',
+
+        diagnostico_charge:
+          '/diagnostico-charge/:chargeId',
  
         sincronizar_planos_efi:
           '/sincronizar-planos-efi',

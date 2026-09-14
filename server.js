@@ -1,7 +1,7 @@
 // ============================================================
 // ACHE OBRA - BACKEND EFÍ COM LOGS SEGUROS DE TRANSAÇÕES
 // Gerado a partir do server.js fornecido pelo usuário.
-// Revisão: histórico completo de cobranças recorrentes, pendências, confirmação financeira definitiva e diagnóstico seguro de charge.
+// Revisão: histórico recorrente + troca segura completa entre avulso/recorrente + sincronização definitiva de tab_usuarios.
 // ============================================================
 
 const express = require('express');
@@ -2122,6 +2122,283 @@ async function buscarPlanoRecorrentePorIdSupabase(planoId) {
     : null;
 }
 
+
+// ============================================================
+// SUPABASE - PLANO ATIVO DO USUÁRIO
+// ============================================================
+//
+// tab_usuarios é a fonte usada pelo Flutter para descobrir qual
+// plano deve aparecer como "PLANO ATUAL".
+//
+// Portanto, não basta atualizar tab_assinaturas:
+// sempre que um pagamento de plano for confirmado, o backend
+// também sincroniza tab_usuarios.
+//
+// Isso permite os quatro fluxos com segurança:
+// - avulso -> avulso
+// - avulso -> recorrente
+// - recorrente -> recorrente
+// - recorrente -> avulso
+// ============================================================
+
+async function buscarPlanoPorIdSupabase(planoId) {
+  const id = String(planoId || '').trim();
+
+  if (!id) {
+    return null;
+  }
+
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+
+  const response = await requisicaoSupabaseInterna({
+    method: 'GET',
+    url: `${supabaseUrl}/rest/v1/tab_planos`,
+    params: {
+      select: '*',
+      id: `eq.${id}`,
+      limit: 1,
+    },
+    timeout: 30000,
+  });
+
+  return Array.isArray(response.data)
+    ? response.data[0] || null
+    : null;
+}
+
+function obterNomeBasePlano(nomePlano) {
+  const nome = String(nomePlano || '').trim();
+
+  if (!nome) {
+    return 'Plano';
+  }
+
+  const partes = nome
+    .split(/\s+-\s+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+  return partes.length > 0
+    ? partes[partes.length - 1]
+    : nome;
+}
+
+async function atualizarPlanoAtivoUsuarioSupabase({
+  usuarioId,
+  planoId,
+  recorrente,
+  dataAtivacao = null,
+}) {
+  const idUsuario = String(usuarioId || '').trim();
+  const idPlano = String(planoId || '').trim();
+
+  if (!idUsuario || !idPlano) {
+    throw new Error(
+      'usuario_id e plano_id são obrigatórios para atualizar o plano ativo do usuário.'
+    );
+  }
+
+  const plano = await buscarPlanoPorIdSupabase(idPlano);
+
+  if (!plano?.id) {
+    throw new Error(
+      'O pagamento foi confirmado, mas o plano não foi encontrado em tab_planos.'
+    );
+  }
+
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+
+  const agora =
+    normalizarDataIso(dataAtivacao) ||
+    new Date().toISOString();
+
+  const response = await requisicaoSupabaseInterna({
+    method: 'PATCH',
+    url: `${supabaseUrl}/rest/v1/tab_usuarios`,
+    params: {
+      id: `eq.${idUsuario}`,
+    },
+    headers: {
+      Prefer: 'return=representation',
+    },
+    data: {
+      nome_plano_ativo:
+        obterNomeBasePlano(plano.nome_plano),
+      id_plano_atual:
+        idPlano,
+      plano_id:
+        idPlano,
+      recorrente:
+        Boolean(recorrente),
+      plano_data_ativacao:
+        agora,
+    },
+    timeout: 30000,
+  });
+
+  const usuarioAtualizado =
+    Array.isArray(response.data)
+      ? response.data[0] || null
+      : null;
+
+  if (!usuarioAtualizado) {
+    throw new Error(
+      'O pagamento foi confirmado, mas tab_usuarios não retornou o usuário após atualizar o plano.'
+    );
+  }
+
+  const planoGravado =
+    String(
+      usuarioAtualizado.id_plano_atual ||
+      usuarioAtualizado.plano_id ||
+      ''
+    ).trim();
+
+  if (planoGravado !== idPlano) {
+    throw new Error(
+      'O pagamento foi confirmado, mas o novo plano não foi gravado corretamente em tab_usuarios.'
+    );
+  }
+
+  console.log(
+    `>>> tab_usuarios atualizado. Usuário ref ${referenciaSegura(idUsuario)} | plano ${idPlano} | recorrente=${Boolean(recorrente)}.`
+  );
+
+  return {
+    usuario: usuarioAtualizado,
+    plano,
+  };
+}
+
+async function buscarAssinaturasAbertasPorUsuario(usuarioId) {
+  const idUsuario = String(usuarioId || '').trim();
+
+  if (!idUsuario) {
+    return [];
+  }
+
+  const { supabaseUrl } = obterConfiguracaoSupabase();
+
+  const response = await requisicaoSupabaseInterna({
+    method: 'GET',
+    url: `${supabaseUrl}/rest/v1/tab_assinaturas`,
+    params: {
+      select: '*',
+      usuario_id: `eq.${idUsuario}`,
+      status_assinatura:
+        'in.(ativo,inadimplente,pagamento_pendente)',
+      order: 'created_at.desc',
+    },
+    timeout: 30000,
+  });
+
+  return Array.isArray(response.data)
+    ? response.data
+    : [];
+}
+
+async function cancelarAssinaturasAbertasAntesDePlanoAvulso({
+  usuarioId,
+  motivo,
+}) {
+  const assinaturas =
+    await buscarAssinaturasAbertasPorUsuario(usuarioId);
+
+  if (assinaturas.length === 0) {
+    return [];
+  }
+
+  const accessToken = await obterTokenCobranca();
+  const canceladas = [];
+
+  for (const assinatura of assinaturas) {
+    const subscriptionId =
+      String(
+        assinatura?.efi_subscription_id || ''
+      ).trim();
+
+    if (!subscriptionId) {
+      throw new Error(
+        'Existe assinatura recorrente aberta sem efi_subscription_id. O plano avulso não será ativado automaticamente.'
+      );
+    }
+
+    await cancelarAssinaturaEfiConfirmandoEstado(
+      accessToken,
+      subscriptionId
+    );
+
+    const agora = new Date().toISOString();
+
+    await atualizarAssinaturaPorSubscriptionId(
+      subscriptionId,
+      {
+        status_assinatura: 'cancelado',
+        ultimo_status_efi: 'canceled',
+        cancelado_em: agora,
+        motivo_cancelamento:
+          motivo ||
+          'Cancelamento automático após confirmação de novo plano avulso.',
+        data_inicio_inadimplencia: null,
+        data_fim_carencia: null,
+      }
+    );
+
+    canceladas.push(subscriptionId);
+
+    console.log(
+      `>>> Assinatura recorrente ${subscriptionId} cancelada antes da ativação do plano avulso.`
+    );
+  }
+
+  return canceladas;
+}
+
+async function finalizarAtivacaoPlanoAvulsoPago({
+  usuarioId,
+  planoId,
+  dataPagamento = null,
+  motivoTroca = null,
+}) {
+  const idUsuario = String(usuarioId || '').trim();
+  const idPlano = String(planoId || '').trim();
+
+  if (!idUsuario || !idPlano) {
+    throw new Error(
+      'Não foi possível ativar o plano avulso: usuario_id ou plano_id ausente.'
+    );
+  }
+
+  const assinaturasCanceladas =
+    await cancelarAssinaturasAbertasAntesDePlanoAvulso({
+      usuarioId: idUsuario,
+      motivo:
+        motivoTroca ||
+        `Troca automática para plano avulso ${idPlano} após pagamento confirmado.`,
+    });
+
+  const sincronizacaoUsuario =
+    await atualizarPlanoAtivoUsuarioSupabase({
+      usuarioId: idUsuario,
+      planoId: idPlano,
+      recorrente: false,
+      dataAtivacao:
+        dataPagamento ||
+        new Date().toISOString(),
+    });
+
+  return {
+    ativado: true,
+    plano_id: idPlano,
+    assinaturas_recorrentes_canceladas:
+      assinaturasCanceladas,
+    usuario:
+      sincronizacaoUsuario.usuario,
+    plano:
+      sincronizacaoUsuario.plano,
+  };
+}
+
 async function cancelarAssinaturaEfiPorId(
   accessToken,
   subscriptionId
@@ -2328,18 +2605,29 @@ async function finalizarAtivacaoAssinaturaPaga({
       .toLowerCase();
 
   if (statusLocalAtual === 'ativo') {
+    const dataAtivacao =
+      normalizarDataIso(dataPagamento) ||
+      assinaturaNova.data_ultimo_pagamento ||
+      new Date().toISOString();
+
     const atualizada =
       await atualizarAssinaturaPorSubscriptionId(
         novaSubscriptionId,
         {
           data_ultimo_pagamento:
-            normalizarDataIso(dataPagamento) ||
-            assinaturaNova.data_ultimo_pagamento ||
-            new Date().toISOString(),
+            dataAtivacao,
           data_inicio_inadimplencia: null,
           data_fim_carencia: null,
         }
       );
+
+    await atualizarPlanoAtivoUsuarioSupabase({
+      usuarioId,
+      planoId:
+        assinaturaNova.plano_id,
+      recorrente: true,
+      dataAtivacao,
+    });
 
     return {
       ativada: true,
@@ -2420,6 +2708,18 @@ async function finalizarAtivacaoAssinaturaPaga({
       'A assinatura anterior foi tratada, mas não foi possível ativar a nova assinatura no Supabase.'
     );
   }
+
+  await atualizarPlanoAtivoUsuarioSupabase({
+    usuarioId,
+    planoId:
+      assinaturaNovaAtiva.plano_id ||
+      assinaturaNova.plano_id,
+    recorrente: true,
+    dataAtivacao:
+      normalizarDataIso(dataPagamento) ||
+      assinaturaNovaAtiva.data_ultimo_pagamento ||
+      agora,
+  });
 
   try {
     await vincularPagamentosRecorrentesOrfaosAssinatura(
@@ -3878,17 +4178,82 @@ app.get(
           usuario.id
         );
 
+      let trocaPlanoConcluida = null;
+      let erroTrocaPlano = null;
+
+      const pagamentoAtual =
+        resultado.pagamento ||
+        pagamento;
+
+      const origemTipo =
+        String(
+          pagamentoAtual?.origem_tipo || ''
+        )
+          .trim()
+          .toLowerCase();
+
+      const planoIdAvulso =
+        normalizarUuidOuNull(
+          pagamentoAtual?.origem_id
+        );
+
+      if (
+        resultado.pago &&
+        origemTipo === 'plano_categoria' &&
+        planoIdAvulso
+      ) {
+        try {
+          await finalizarAtivacaoPlanoAvulsoPago({
+            usuarioId:
+              usuario.id,
+            planoId:
+              planoIdAvulso,
+            dataPagamento:
+              pagamentoAtual?.data_pagamento ||
+              new Date().toISOString(),
+            motivoTroca:
+              `Troca para plano avulso ${planoIdAvulso} após confirmação do Pix ${txid}.`,
+          });
+
+          trocaPlanoConcluida = true;
+
+        } catch (erroTroca) {
+          trocaPlanoConcluida = false;
+          erroTrocaPlano =
+            resumirErroSeguro(erroTroca);
+
+          console.error(
+            '>>> Pix confirmado, mas a troca segura de plano avulso ainda não foi concluída:',
+            erroTrocaPlano
+          );
+        }
+      }
+
+      const liberarPlano =
+        resultado.pago &&
+        trocaPlanoConcluida !== false;
+
       return res.json({
         success: true,
-        pago: resultado.pago,
+        pago: liberarPlano,
+        pagamento_confirmado:
+          resultado.pago,
+        troca_plano:
+          trocaPlanoConcluida,
+        erro_troca_plano:
+          erroTrocaPlano,
         status:
-          resultado.pago
+          liberarPlano
             ? 'pago'
-            : 'aguardando_pagamento',
+            : (
+                resultado.pago
+                  ? 'pagamento_confirmado_aguardando_troca'
+                  : 'aguardando_pagamento'
+              ),
         status_efi: resultado.status_efi,
         txid: resultado.txid,
         e2e_id: resultado.e2e_id,
-        pagamento: resultado.pagamento,
+        pagamento: pagamentoAtual,
       });
 
     } catch (error) {
@@ -4328,15 +4693,72 @@ app.post(
       }
 
  
+      let trocaPlanoConcluida = null;
+      let erroTrocaPlano = null;
+
+      const origemTipoNormalizada =
+        String(origem_tipo || '')
+          .trim()
+          .toLowerCase();
+
+      const planoIdAvulso =
+        normalizarUuidOuNull(origem_id);
+
+      if (
+        pagamentoConfirmado &&
+        usuario_id &&
+        origemTipoNormalizada === 'plano_categoria' &&
+        planoIdAvulso
+      ) {
+        try {
+          await finalizarAtivacaoPlanoAvulsoPago({
+            usuarioId:
+              String(usuario_id),
+            planoId:
+              planoIdAvulso,
+            dataPagamento:
+              pagamentoAvulsoSalvo?.data_pagamento ||
+              new Date().toISOString(),
+            motivoTroca:
+              `Troca para plano avulso ${planoIdAvulso} após confirmação da cobrança ${String(chargeId)}.`,
+          });
+
+          trocaPlanoConcluida = true;
+
+        } catch (erroTroca) {
+          trocaPlanoConcluida = false;
+          erroTrocaPlano =
+            resumirErroSeguro(erroTroca);
+
+          console.error(
+            '>>> Cartão avulso pago, mas a troca segura de plano ainda não foi concluída:',
+            erroTrocaPlano
+          );
+        }
+      }
+
+      const liberarPlano =
+        pagamentoConfirmado &&
+        trocaPlanoConcluida !== false;
+
       return res.json({
         success:
           true,
  
         approved:
-          aprovado,
- 
+          liberarPlano,
+
         pago:
-          aprovado,
+          pagamentoConfirmado,
+
+        pagamento_confirmado:
+          pagamentoConfirmado,
+
+        troca_plano:
+          trocaPlanoConcluida,
+
+        erro_troca_plano:
+          erroTrocaPlano,
  
         charge_id:
           chargeId,
@@ -6075,6 +6497,23 @@ app.post(
 
       novaAssinaturaSalva =
         Boolean(registroNovaAssinatura);
+
+      if (!registroNovaAssinatura) {
+        throw new Error(
+          'A assinatura anterior foi cancelada, mas a nova assinatura não pôde ser confirmada no Supabase.'
+        );
+      }
+
+      await atualizarPlanoAtivoUsuarioSupabase({
+        usuarioId:
+          String(usuario.id),
+        planoId:
+          novoPlanoId,
+        recorrente:
+          true,
+        dataAtivacao:
+          agora,
+      });
 
       console.log(
         `>>> Troca concluída: ${assinaturaAtualId} -> ${novaSubscriptionId}.`

@@ -4874,6 +4874,51 @@ status:
           );
       }
  
+      // --------------------------------------------------------
+      // ERRO DE REGRA EFÍ: RECEBEDOR E PAGADOR/TITULAR
+      // --------------------------------------------------------
+      //
+      // Em produção a Efí pode impedir uma cobrança quando identifica
+      // que o recebedor da conta e a pessoa pagadora/titular envolvida
+      // na transação são a mesma pessoa. Esse retorno NÃO representa
+      // falha técnica do Render e não deve ser mascarado como HTTP 500
+      // interno do Ache Obra.
+      //
+      // Importante: o backend não tenta contornar essa validação e não
+      // altera CPF/nome/payment_token. Os dados do customer continuam
+      // sendo exatamente os dados do titular enviados pelo Flutter.
+      // --------------------------------------------------------
+
+      const mensagemNormalizada =
+        String(mensagem || '')
+          .trim()
+          .toLowerCase();
+
+      const recebedorEhCliente =
+        mensagemNormalizada.includes(
+          'recebedor e cliente não podem ser a mesma pessoa'
+        ) ||
+        mensagemNormalizada.includes(
+          'recebedor e cliente nao podem ser a mesma pessoa'
+        );
+
+      if (recebedorEhCliente) {
+        console.warn(
+          '>>> Cobrança recusada por regra da Efí: recebedor e pessoa pagadora/titular identificados como a mesma pessoa.'
+        );
+
+        return res
+          .status(422)
+          .json({
+            success: false,
+            approved: false,
+            codigo: 'EFI_RECEBEDOR_IGUAL_CLIENTE',
+            error:
+              'A Efí não permite concluir esta cobrança porque identificou o recebedor e a pessoa pagadora/titular como a mesma pessoa. Use um cartão pertencente a outra pessoa, com o nome e CPF reais do titular do cartão.',
+            efi: respostaEfi || null,
+          });
+      }
+
       return res
         .status(
           error.response

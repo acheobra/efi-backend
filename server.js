@@ -7648,14 +7648,14 @@
      
     app.post(
       '/cancelar-assinatura',
-     
+
       async (req, res) => {
         try {
           const usuario =
             await obterUsuarioSupabaseDoBearer(
               req
             );
-     
+
           if (!usuario?.id) {
             return res
               .status(401)
@@ -7665,26 +7665,127 @@
                   'Usuário não autenticado.',
               });
           }
-     
-          const assinatura =
-            await buscarAssinaturaAtivaPorUsuario(
-              usuario.id
-            );
-     
-          if (!assinatura) {
-            return res
-              .status(404)
-              .json({
-                success: false,
-                error:
-                  'Nenhuma assinatura ativa encontrada para este usuário.',
-              });
+
+          // --------------------------------------------------------
+          // IDENTIFICAÇÃO SEGURA DA ASSINATURA EFÍ A SER CANCELADA
+          // --------------------------------------------------------
+          //
+          // O Flutter corrigido envia explicitamente subscription_id.
+          // Quando ele é informado, o backend NÃO escolhe outra
+          // assinatura automaticamente: procura exatamente esse ID e
+          // confirma que pertence ao usuário autenticado.
+          //
+          // Compatibilidade:
+          // versões antigas do app que ainda não enviarem
+          // subscription_id continuam podendo usar a busca da
+          // assinatura aberta do próprio usuário.
+          // --------------------------------------------------------
+
+          const subscriptionIdSolicitado =
+            String(
+              req.body?.subscription_id ||
+              req.body?.efi_subscription_id ||
+              ''
+            ).trim();
+
+          const planoIdSolicitado =
+            String(
+              req.body?.plano_id ||
+              ''
+            ).trim();
+
+          let assinatura = null;
+
+          if (subscriptionIdSolicitado) {
+            assinatura =
+              await buscarAssinaturaPorSubscriptionId(
+                subscriptionIdSolicitado
+              );
+
+            if (!assinatura) {
+              return res
+                .status(404)
+                .json({
+                  success: false,
+                  error:
+                    'A assinatura Efí informada não foi encontrada.',
+                });
+            }
+
+            const usuarioAssinatura =
+              String(
+                assinatura.usuario_id ||
+                ''
+              ).trim();
+
+            if (
+              !usuarioAssinatura ||
+              usuarioAssinatura !==
+                String(usuario.id).trim()
+            ) {
+              console.warn(
+                `>>> Tentativa bloqueada de cancelar assinatura Efí que não pertence ao usuário autenticado. Usuário ref ${referenciaSegura(usuario.id)}.`
+              );
+
+              return res
+                .status(403)
+                .json({
+                  success: false,
+                  error:
+                    'A assinatura informada não pertence ao usuário autenticado.',
+                });
+            }
+
+            if (planoIdSolicitado) {
+              const planoAssinatura =
+                String(
+                  assinatura.plano_id ||
+                  ''
+                ).trim();
+
+              if (
+                planoAssinatura &&
+                planoAssinatura !==
+                  planoIdSolicitado
+              ) {
+                console.warn(
+                  `>>> Cancelamento bloqueado por divergência de plano. Usuário ref ${referenciaSegura(usuario.id)} | assinatura ${subscriptionIdSolicitado}.`
+                );
+
+                return res
+                  .status(409)
+                  .json({
+                    success: false,
+                    error:
+                      'A assinatura Efí informada não corresponde ao plano solicitado.',
+                  });
+              }
+            }
+          } else {
+            // Compatibilidade com versões anteriores do aplicativo.
+            assinatura =
+              await buscarAssinaturaAtivaPorUsuario(
+                usuario.id
+              );
+
+            if (!assinatura) {
+              return res
+                .status(404)
+                .json({
+                  success: false,
+                  error:
+                    'Nenhuma assinatura ativa encontrada para este usuário.',
+                });
+            }
           }
-     
+
           const subscriptionId =
-            assinatura
-              .efi_subscription_id;
-     
+            String(
+              assinatura
+                ?.efi_subscription_id ||
+              ''
+            ).trim();
+
           if (!subscriptionId) {
             return res
               .status(409)
@@ -7694,86 +7795,139 @@
                   'A assinatura não possui efi_subscription_id.',
               });
           }
-     
+
+          // Proteção adicional: mesmo no fallback legado, a assinatura
+          // selecionada precisa pertencer ao usuário autenticado.
+          if (
+            String(
+              assinatura.usuario_id ||
+              ''
+            ).trim() !==
+            String(usuario.id).trim()
+          ) {
+            return res
+              .status(403)
+              .json({
+                success: false,
+                error:
+                  'A assinatura selecionada não pertence ao usuário autenticado.',
+              });
+          }
+
           const accessToken =
             await obterTokenCobranca();
-     
+
           console.log(
             `>>> Cancelando assinatura Efí ${subscriptionId} do usuário ref ${referenciaSegura(usuario.id)}.`
           );
-     
-          await axios({
-            method: 'PUT',
-     
-            url:
-              `${EFI_COBRANCA_API_URL}/subscription/${encodeURIComponent(
-                subscriptionId
-              )}/cancel`,
-     
-            headers: {
-              Authorization:
-                `Bearer ${accessToken}`,
-     
-              'Content-Type':
-                'application/json',
-            },
-     
-            httpsAgent,
-     
-            timeout:
-              30000,
-          });
-     
+
+          // Usa o helper robusto já existente no backend.
+          // Se a Efí responder erro ao PUT, o helper consulta o estado
+          // remoto e aceita como sucesso apenas se a assinatura já
+          // estiver canceled/cancelled/expired.
+          const resultadoCancelamento =
+            await cancelarAssinaturaEfiConfirmandoEstado(
+              accessToken,
+              subscriptionId
+            );
+
+          if (!resultadoCancelamento?.cancelada) {
+            return res
+              .status(502)
+              .json({
+                success: false,
+                error:
+                  'A Efí não confirmou o cancelamento da assinatura.',
+                efi_subscription_id:
+                  subscriptionId,
+              });
+          }
+
           const agora =
             new Date().toISOString();
-     
-          await atualizarAssinaturaPorSubscriptionId(
-            String(subscriptionId),
-            {
-              status_assinatura:
-                'cancelado',
-     
-              ultimo_status_efi:
-                'canceled',
-     
-              cancelado_em:
-                agora,
-     
-              motivo_cancelamento:
-                String(
-                  req.body?.motivo ||
-                  'Cancelado pelo usuário no aplicativo.'
-                ).substring(0, 500),
-     
-              data_inicio_inadimplencia:
-                null,
-     
-              data_fim_carencia:
-                null,
-            }
-          );
-     
+
+          const assinaturaAtualizada =
+            await atualizarAssinaturaPorSubscriptionId(
+              subscriptionId,
+              {
+                status_assinatura:
+                  'cancelado',
+
+                ultimo_status_efi:
+                  resultadoCancelamento
+                    ?.status_efi ||
+                  'canceled',
+
+                cancelado_em:
+                  agora,
+
+                motivo_cancelamento:
+                  String(
+                    req.body?.motivo ||
+                    'Cancelado pelo usuário no aplicativo.'
+                  ).substring(0, 500),
+
+                data_inicio_inadimplencia:
+                  null,
+
+                data_fim_carencia:
+                  null,
+              }
+            );
+
+          if (!assinaturaAtualizada) {
+            // A Efí já confirmou o cancelamento. Portanto não devemos
+            // responder como se o cancelamento remoto tivesse falhado.
+            // Retornamos sucesso com aviso para permitir reconciliação
+            // do estado local sem provocar nova cobrança.
+            console.error(
+              `>>> ATENÇÃO: assinatura ${subscriptionId} foi cancelada na Efí, mas a atualização local em tab_assinaturas não retornou registro.`
+            );
+
+            return res
+              .status(200)
+              .json({
+                success: true,
+                status:
+                  'cancelado',
+                efi_subscription_id:
+                  subscriptionId,
+                ja_estava_cancelada:
+                  Boolean(
+                    resultadoCancelamento
+                      ?.ja_estava_cancelada
+                  ),
+                aviso:
+                  'Cancelamento confirmado na Efí, mas o registro local precisa ser reconciliado.',
+              });
+          }
+
           console.log(
-            `>>> Assinatura ${subscriptionId} cancelada com sucesso.`
+            `>>> Assinatura ${subscriptionId} cancelada na Efí e atualizada no Supabase com sucesso.`
           );
-     
+
           return res.json({
             success: true,
             status:
               'cancelado',
             efi_subscription_id:
-              String(subscriptionId),
+              subscriptionId,
+            ja_estava_cancelada:
+              Boolean(
+                resultadoCancelamento
+                  ?.ja_estava_cancelada
+              ),
           });
-     
+
         } catch (error) {
           console.error(
             '>>> ERRO AO CANCELAR ASSINATURA:',
             resumirErroSeguro(error)
           );
-     
+
           const respostaEfi =
             error.response?.data;
-     
+
           let mensagem =
             respostaEfi
               ?.error_description ||
@@ -7782,7 +7936,7 @@
             respostaEfi
               ?.error ||
             error.message;
-     
+
           if (
             typeof mensagem !==
             'string'
@@ -7792,7 +7946,7 @@
                 mensagem
               );
           }
-     
+
           return res
             .status(
               error.response?.status ||

@@ -1245,6 +1245,125 @@ async function processarDevolucaoPixPendente(pagamento) {
 
 
 // ============================================================
+// EFÍ - CONFIRMAÇÃO IMEDIATA DE COBRANÇA NO CARTÃO
+// ============================================================
+// A API pode retornar "approved" e mudar para "paid" poucos segundos
+// depois. Para que a tela só mostre PAGAMENTO CONFIRMADO quando o plano
+// já estiver efetivamente ativo, aguardamos por um curto período e
+// consultamos a cobrança diretamente na Efí.
+//
+// O webhook continua sendo a garantia assíncrona caso a confirmação
+// aconteça depois desta janela.
+// ============================================================
+
+async function consultarCobrancaCartaoEfi(accessToken, chargeId) {
+  const response = await axios({
+    method: 'GET',
+    url: `${EFI_COBRANCA_API_URL}/charge/${encodeURIComponent(String(chargeId))}`,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    httpsAgent,
+    timeout: 30000,
+  });
+
+  return response.data?.data || {};
+}
+
+function statusCobrancaCartaoPago(status) {
+  const normalizado = String(status || '').trim().toLowerCase();
+  return normalizado === 'paid' || normalizado === 'settled';
+}
+
+function statusCobrancaCartaoFinalSemPagamento(status) {
+  const normalizado = String(status || '').trim().toLowerCase();
+  return [
+    'refused',
+    'declined',
+    'denied',
+    'canceled',
+    'cancelled',
+    'expired',
+    'refunded',
+  ].includes(normalizado);
+}
+
+async function aguardarConfirmacaoCobrancaCartaoEfi(
+  accessToken,
+  chargeId,
+  {
+    statusInicial = null,
+    tentativas = 12,
+    intervaloMs = 1500,
+  } = {}
+) {
+  const id = String(chargeId || '').trim();
+  let statusAtual = String(statusInicial || '').trim().toLowerCase();
+  let cobranca = null;
+
+  if (!id) {
+    return {
+      confirmado: statusCobrancaCartaoPago(statusAtual),
+      status: statusAtual || null,
+      cobranca: null,
+    };
+  }
+
+  if (statusCobrancaCartaoPago(statusAtual)) {
+    return { confirmado: true, status: statusAtual, cobranca: null };
+  }
+
+  if (statusCobrancaCartaoFinalSemPagamento(statusAtual)) {
+    return { confirmado: false, status: statusAtual, cobranca: null };
+  }
+
+  for (let tentativa = 1; tentativa <= tentativas; tentativa++) {
+    if (tentativa > 1 || statusAtual) {
+      await aguardar(intervaloMs);
+    }
+
+    try {
+      cobranca = await consultarCobrancaCartaoEfi(accessToken, id);
+      statusAtual = String(cobranca?.status || statusAtual || '')
+        .trim()
+        .toLowerCase();
+
+      console.log(
+        `>>> Confirmação cartão ${id}: tentativa ${tentativa}/${tentativas} | status Efí: ${statusAtual || 'não informado'}`
+      );
+
+      if (statusCobrancaCartaoPago(statusAtual)) {
+        return {
+          confirmado: true,
+          status: statusAtual,
+          cobranca,
+        };
+      }
+
+      if (statusCobrancaCartaoFinalSemPagamento(statusAtual)) {
+        return {
+          confirmado: false,
+          status: statusAtual,
+          cobranca,
+        };
+      }
+    } catch (error) {
+      console.warn(
+        `>>> Falha transitória ao consultar confirmação da cobrança ${id}:`,
+        resumirErroSeguro(error)
+      );
+    }
+  }
+
+  return {
+    confirmado: false,
+    status: statusAtual || null,
+    cobranca,
+  };
+}
+
+// ============================================================
 // ESTORNO PENDENTE - PAGAMENTOS AVULSOS NO CARTÃO
 // ============================================================
 
@@ -2910,29 +3029,116 @@ async function aplicarEventoNotificacaoEfi(
     evento?.identifiers?.charge_id;
  
   // Eventos sem subscription_id podem pertencer a cobranças avulsas.
-  // Se houver um estorno pendente e a cobrança chegar a paid, dispara o refund.
+  // Além de estorno, conciliamos o pagamento e ativamos o plano imediatamente
+  // quando a Efí confirmar paid/settled.
   if (!subscriptionId) {
     if (chargeId) {
+      const idCharge = String(chargeId);
+
       try {
+        const pagamentoAvulso =
+          await buscarPagamentoAvulsoCartaoPorChargeId(idCharge);
+
+        if (pagamentoAvulso?.id) {
+          const pago = statusCobrancaCartaoPago(statusAtual);
+          const statusLocalAtual = String(pagamentoAvulso.status || '')
+            .trim()
+            .toLowerCase();
+
+          if (pago) {
+            const dataPagamento =
+              normalizarDataIso(evento?.received_by_bank_at) ||
+              pagamentoAvulso.data_pagamento ||
+              new Date().toISOString();
+
+            const pagamentoAtualizado =
+              await atualizarPagamentoAvulsoPorId(
+                pagamentoAvulso.id,
+                {
+                  status: 'pago',
+                  data_pagamento: dataPagamento,
+                }
+              );
+
+            const origemTipo = String(pagamentoAvulso.origem_tipo || '')
+              .trim()
+              .toLowerCase();
+            const planoId = normalizarUuidOuNull(pagamentoAvulso.origem_id);
+
+            let planoAtivado = false;
+
+            if (
+              pagamentoAvulso.usuario_id &&
+              origemTipo === 'plano_categoria' &&
+              planoId
+            ) {
+              await finalizarAtivacaoPlanoAvulsoPago({
+                usuarioId: String(pagamentoAvulso.usuario_id),
+                planoId,
+                dataPagamento,
+                motivoTroca:
+                  `Troca para plano avulso ${planoId} após confirmação Efí pelo webhook da cobrança ${idCharge}.`,
+              });
+              planoAtivado = true;
+            }
+
+            console.log(
+              `>>> Webhook confirmou cobrança avulsa ${idCharge} como paga. Plano ativado: ${planoAtivado}.`
+            );
+
+            return {
+              ignorado: false,
+              tipo,
+              status: statusAtual,
+              charge_id: idCharge,
+              pagamento_avulso_id: pagamentoAtualizado?.id || pagamentoAvulso.id,
+              plano_ativado: planoAtivado,
+            };
+          }
+
+          // Nunca rebaixa um pagamento já confirmado por evento intermediário.
+          if (statusLocalAtual !== 'pago') {
+            const statusLocal =
+              statusCobrancaCartaoFinalSemPagamento(statusAtual)
+                ? (
+                    statusAtual === 'refunded'
+                      ? 'estornado'
+                      : 'recusado'
+                  )
+                : 'aguardando_pagamento';
+
+            await atualizarPagamentoAvulsoPorId(
+              pagamentoAvulso.id,
+              { status: statusLocal }
+            );
+          }
+        }
+
+        // Mantém a lógica de estorno pendente já existente.
         const resultadoEstorno = await processarEstornoPendentePorChargeId(
-          String(chargeId),
+          idCharge,
           statusAtual
         );
+
         return {
-          ignorado: !resultadoEstorno?.processado,
+          ignorado: !pagamentoAvulso && !resultadoEstorno?.processado,
           tipo,
           status: statusAtual,
-          charge_id: String(chargeId),
+          charge_id: idCharge,
+          pagamento_avulso_encontrado: Boolean(pagamentoAvulso),
           estorno_avulso: resultadoEstorno,
         };
       } catch (error) {
-        console.error('>>> Erro ao processar estorno pendente pelo webhook:', resumirErroSeguro(error));
+        console.error(
+          '>>> Erro ao conciliar cobrança avulsa pelo webhook:',
+          resumirErroSeguro(error)
+        );
         return {
           ignorado: false,
           tipo,
           status: statusAtual,
-          charge_id: String(chargeId),
-          erro_estorno_avulso: resumirErroSeguro(error),
+          charge_id: idCharge,
+          erro_avulso: resumirErroSeguro(error),
         };
       }
     }
@@ -4564,7 +4770,7 @@ app.post(
         dados?.data
           ?.charge_id;
  
-      const status =
+      let status =
         dados?.data
           ?.status;
  
@@ -4572,6 +4778,22 @@ app.post(
         dados?.data
           ?.refusal ||
         null;
+
+      // A Efí pode responder "approved" antes de registrar "paid".
+      // Aguarda a confirmação por alguns segundos para que o plano seja
+      // ativado ANTES de o Flutter receber pagamento_confirmado=true.
+      if (chargeId && !statusCobrancaCartaoPago(status)) {
+        const confirmacaoImediata =
+          await aguardarConfirmacaoCobrancaCartaoEfi(
+            accessToken,
+            chargeId,
+            { statusInicial: status }
+          );
+
+        if (confirmacaoImediata?.status) {
+          status = confirmacaoImediata.status;
+        }
+      }
  
       console.log(
         '>>> Cobrança processada pela Efí.'
@@ -5307,7 +5529,7 @@ app.post(
         dadosAssinatura
           .status;
  
-      const charge =
+      let charge =
         dadosAssinatura
           .charge ||
         null;
@@ -5339,8 +5561,26 @@ app.post(
       const statusAssinaturaEfi =
         String(status || '').trim().toLowerCase();
 
-      const statusPrimeiraCobranca =
+      let statusPrimeiraCobranca =
         String(charge?.status || '').trim().toLowerCase();
+
+      if (charge?.charge_id && !statusCobrancaCartaoPago(statusPrimeiraCobranca)) {
+        const confirmacaoImediata =
+          await aguardarConfirmacaoCobrancaCartaoEfi(
+            accessToken,
+            charge.charge_id,
+            { statusInicial: statusPrimeiraCobranca }
+          );
+
+        if (confirmacaoImediata?.status) {
+          statusPrimeiraCobranca = confirmacaoImediata.status;
+          charge = {
+            ...charge,
+            ...(confirmacaoImediata.cobranca || {}),
+            status: confirmacaoImediata.status,
+          };
+        }
+      }
 
       const pagamentoConfirmado =
         statusPrimeiraCobranca === 'paid' ||
@@ -6178,7 +6418,7 @@ app.post(
           .trim()
           .toLowerCase();
 
-      const novaCharge =
+      let novaCharge =
         novaAssinaturaEfi.charge || null;
 
       if (!novaSubscriptionId) {
@@ -6187,8 +6427,26 @@ app.post(
         );
       }
 
-      const novoStatusCharge =
+      let novoStatusCharge =
         String(novaCharge?.status || '').trim().toLowerCase();
+
+      if (novaCharge?.charge_id && !statusCobrancaCartaoPago(novoStatusCharge)) {
+        const confirmacaoImediata =
+          await aguardarConfirmacaoCobrancaCartaoEfi(
+            accessToken,
+            novaCharge.charge_id,
+            { statusInicial: novoStatusCharge }
+          );
+
+        if (confirmacaoImediata?.status) {
+          novoStatusCharge = confirmacaoImediata.status;
+          novaCharge = {
+            ...novaCharge,
+            ...(confirmacaoImediata.cobranca || {}),
+            status: confirmacaoImediata.status,
+          };
+        }
+      }
 
       const novoPagamentoConfirmado =
         novoStatusCharge === 'paid' ||

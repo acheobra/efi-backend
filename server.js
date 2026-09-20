@@ -423,9 +423,8 @@ try {
     cert: fs.readFileSync(certPath),
     key: fs.readFileSync(keyPath),
  
-    // Mantido conforme sua configuração atual.
-    // Em produção, o ideal é validar o certificado.
-    rejectUnauthorized: false,
+    // PRODUÇÃO: valida a cadeia TLS do servidor da Efí.
+    rejectUnauthorized: true,
   });
  
   console.log(
@@ -445,11 +444,11 @@ try {
 // ============================================================
  
 // ------------------------------------------------------------
-// PIX - HOMOLOGAÇÃO
+// PIX - PRODUÇÃO
 // ------------------------------------------------------------
  
 const EFI_PIX_BASE_URL =
-  'https://pix-h.api.efipay.com.br';
+  'https://pix.api.efipay.com.br';
 
 const EFI_PIX_AUTH_URL =
   `${EFI_PIX_BASE_URL}/oauth/token`;
@@ -458,11 +457,11 @@ const EFI_PIX_COB_URL =
   `${EFI_PIX_BASE_URL}/v2/cob`;
  
 // ------------------------------------------------------------
-// COBRANÇAS - HOMOLOGAÇÃO
+// COBRANÇAS - PRODUÇÃO
 // ------------------------------------------------------------
  
 const EFI_COBRANCA_BASE_URL =
-  'https://cobrancas-h.api.efipay.com.br';
+  'https://cobrancas.api.efipay.com.br';
  
 const EFI_COBRANCA_AUTH_URL =
   `${EFI_COBRANCA_BASE_URL}/v1/authorize`;
@@ -4025,7 +4024,7 @@ app.post(
               'GET',
  
             url:
-              `https://pix-h.api.efipay.com.br/v2/loc/${locId}`,
+              `https://pix.api.efipay.com.br/v2/loc/${locId}`,
  
             headers: {
               Authorization:
@@ -8087,7 +8086,7 @@ app.get(
 
       return res.json({
         success: true,
-        ambiente: 'homologacao',
+        ambiente: 'producao',
         charge_id: chargeId,
         diagnostico,
       });
@@ -8129,7 +8128,7 @@ app.get(
         'Backend Ache Obra / Efí funcionando.',
  
       ambiente:
-        'homologacao',
+        'producao',
  
       rotas: {
         pix:
@@ -8335,7 +8334,7 @@ app.listen(
     );
  
     console.log(
-      'Ambiente Efí: HOMOLOGAÇÃO'
+      'Ambiente Efí: PRODUÇÃO'
     );
  
     console.log(

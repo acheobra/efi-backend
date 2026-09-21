@@ -1286,6 +1286,7 @@
         'cancelled',
         'expired',
         'refunded',
+        'unpaid',
       ].includes(normalizado);
     }
 
@@ -3337,49 +3338,96 @@
         }
      
         if (statusAtual === 'unpaid') {
-          atualizacao.status_assinatura =
-            'pagamento_pendente';
-     
-          const inicioExistente =
-            assinatura.data_inicio_inadimplencia
-              ? new Date(
-                  assinatura.data_inicio_inadimplencia
-                )
-              : null;
-     
-          const inicioValido =
-            inicioExistente &&
-            !Number.isNaN(
-              inicioExistente.getTime()
+          const primeiraCobrancaSemPagamento =
+            !assinatura.data_ultimo_pagamento &&
+            String(assinatura.status_assinatura || '')
+              .trim()
+              .toLowerCase() === 'pagamento_pendente';
+
+          if (primeiraCobrancaSemPagamento) {
+            // A primeira cobrança da NOVA assinatura não foi aprovada.
+            // Cancela somente esta nova assinatura e preserva o plano anterior.
+            const tokenCancelamento =
+              await obterTokenCobranca();
+
+            const cancelamento =
+              await cancelarAssinaturaEfiConfirmandoEstado(
+                tokenCancelamento,
+                String(subscriptionId)
+              );
+
+            if (!cancelamento?.cancelada) {
+              throw new Error(
+                `A primeira cobrança da assinatura ${String(subscriptionId)} ficou unpaid, mas o cancelamento da nova assinatura não pôde ser confirmado na Efí.`
+              );
+            }
+
+            atualizacao.status_assinatura =
+              'cancelado';
+
+            atualizacao.cancelado_em =
+              agora.toISOString();
+
+            atualizacao.motivo_cancelamento =
+              'Primeira cobrança não aprovada pela instituição financeira. Tentativa de contratação encerrada.';
+
+            atualizacao.data_inicio_inadimplencia =
+              null;
+
+            atualizacao.data_fim_carencia =
+              null;
+
+            console.log(
+              `>>> Primeira cobrança da assinatura ${String(subscriptionId)} ficou unpaid. Nova tentativa encerrada; plano anterior preservado.`
             );
-     
-          const inicio =
-            inicioValido
-              ? inicioExistente
-              : agora;
-     
-          const fimCarencia =
-            assinatura.data_fim_carencia
-              ? new Date(
-                  assinatura.data_fim_carencia
-                )
-              : new Date(
-                  inicio.getTime() +
-                  7 * 24 * 60 * 60 * 1000
-                );
-     
-          atualizacao.data_inicio_inadimplencia =
-            inicio.toISOString();
-     
-          atualizacao.data_fim_carencia =
-            Number.isNaN(
-              fimCarencia.getTime()
-            )
-              ? new Date(
-                  agora.getTime() +
-                  7 * 24 * 60 * 60 * 1000
-                ).toISOString()
-              : fimCarencia.toISOString();
+
+          } else {
+            // Assinatura que já teve pagamento confirmado:
+            // unpaid é inadimplência de renovação e mantém a carência.
+            atualizacao.status_assinatura =
+              'inadimplente';
+
+            const inicioExistente =
+              assinatura.data_inicio_inadimplencia
+                ? new Date(
+                    assinatura.data_inicio_inadimplencia
+                  )
+                : null;
+
+            const inicioValido =
+              inicioExistente &&
+              !Number.isNaN(
+                inicioExistente.getTime()
+              );
+
+            const inicio =
+              inicioValido
+                ? inicioExistente
+                : agora;
+
+            const fimCarencia =
+              assinatura.data_fim_carencia
+                ? new Date(
+                    assinatura.data_fim_carencia
+                  )
+                : new Date(
+                    inicio.getTime() +
+                    7 * 24 * 60 * 60 * 1000
+                  );
+
+            atualizacao.data_inicio_inadimplencia =
+              inicio.toISOString();
+
+            atualizacao.data_fim_carencia =
+              Number.isNaN(
+                fimCarencia.getTime()
+              )
+                ? new Date(
+                    agora.getTime() +
+                    7 * 24 * 60 * 60 * 1000
+                  ).toISOString()
+                : fimCarencia.toISOString();
+          }
         }
       }
      
@@ -4915,8 +4963,11 @@
               : (
                   statusNormalizado === 'refused' ||
                   statusNormalizado === 'declined' ||
+                  statusNormalizado === 'denied' ||
                   statusNormalizado === 'canceled' ||
-                  statusNormalizado === 'cancelled'
+                  statusNormalizado === 'cancelled' ||
+                  statusNormalizado === 'expired' ||
+                  statusNormalizado === 'unpaid'
                     ? 'recusado'
                     : 'aguardando_pagamento'
                 );

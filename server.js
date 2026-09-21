@@ -1547,42 +1547,54 @@
     async function buscarAssinaturaAtivaPorUsuario(
       usuarioId
     ) {
-      const {
-        supabaseUrl,
-      } = obterConfiguracaoSupabase();
-     
+      const idUsuario = String(usuarioId || '').trim();
+
+      if (!idUsuario) {
+        return null;
+      }
+
+      const { supabaseUrl } = obterConfiguracaoSupabase();
+
       const response = await requisicaoSupabaseInterna({
         method: 'GET',
-     
-        url:
-          `${supabaseUrl}/rest/v1/tab_assinaturas`,
-     
+        url: `${supabaseUrl}/rest/v1/tab_assinaturas`,
         params: {
           select: '*',
-     
-          usuario_id:
-            `eq.${usuarioId}`,
-     
-          status_assinatura:
-            'in.(ativo,pagamento_pendente,inadimplente)',
-     
-          order:
-            'created_at.desc',
-     
-          limit:
-            1,
+          usuario_id: `eq.${idUsuario}`,
+          status_assinatura: 'in.(ativo,inadimplente)',
+          order: 'created_at.desc',
+          limit: 20,
         },
-     
-     
-        timeout:
-          30000,
+        timeout: 30000,
       });
-     
-      return Array.isArray(response.data)
-        ? response.data[0] || null
-        : null;
+
+      const lista = Array.isArray(response.data)
+        ? response.data
+        : [];
+
+      return (
+        lista.find((item) => {
+          const subscriptionId =
+            String(item?.efi_subscription_id || '').trim();
+
+          const ultimoStatusEfi =
+            String(item?.ultimo_status_efi || '')
+              .trim()
+              .toLowerCase();
+
+          const possuiPagamentoConfirmado =
+            Boolean(item?.data_ultimo_pagamento) ||
+            ultimoStatusEfi === 'paid' ||
+            ultimoStatusEfi === 'settled';
+
+          return Boolean(
+            subscriptionId &&
+            possuiPagamentoConfirmado
+          );
+        }) ||
+        null
+      );
     }
-     
 
 
     // ============================================================
@@ -2239,6 +2251,83 @@
       return Array.isArray(response.data)
         ? response.data[0] || null
         : null;
+    }
+
+
+    async function resolverValorPlanoNoBackend({
+      origemTipo,
+      origemId,
+      recorrente,
+      valorInformado,
+      planIdEfiInformado = null,
+    }) {
+      const tipo =
+        String(origemTipo || '').trim().toLowerCase();
+
+      const idPlano =
+        normalizarUuidOuNull(origemId);
+
+      if (tipo !== 'plano_categoria' || !idPlano) {
+        const valorNumero = Number(valorInformado);
+
+        if (!Number.isFinite(valorNumero) || valorNumero <= 0) {
+          const erro = new Error('Valor inválido.');
+          erro.statusCode = 400;
+          throw erro;
+        }
+
+        return { valor: valorNumero, plano: null };
+      }
+
+      const plano =
+        await buscarPlanoPorIdSupabase(idPlano);
+
+      if (!plano) {
+        const erro = new Error('Plano não encontrado no Supabase.');
+        erro.statusCode = 404;
+        throw erro;
+      }
+
+      const valorBanco =
+        recorrente
+          ? Number(plano.valor_recorrente)
+          : Number(plano.valor);
+
+      if (!Number.isFinite(valorBanco) || valorBanco <= 0) {
+        const erro = new Error(
+          recorrente
+            ? 'O plano não possui valor_recorrente válido.'
+            : 'O plano não possui valor avulso válido.'
+        );
+        erro.statusCode = 409;
+        throw erro;
+      }
+
+      if (recorrente) {
+        const planIdBanco =
+          String(plano.efi_plan_id || '').trim();
+
+        const planIdRecebido =
+          String(planIdEfiInformado || '').trim();
+
+        if (!planIdBanco) {
+          const erro = new Error(
+            'O plano ainda não possui efi_plan_id sincronizado.'
+          );
+          erro.statusCode = 409;
+          throw erro;
+        }
+
+        if (planIdRecebido && planIdRecebido !== planIdBanco) {
+          const erro = new Error(
+            'O plan_id informado não corresponde ao plano selecionado.'
+          );
+          erro.statusCode = 409;
+          throw erro;
+        }
+      }
+
+      return { valor: valorBanco, plano };
     }
 
 
@@ -3262,14 +3351,26 @@
      
       if (tipo === 'subscription') {
         if (statusAtual === 'active') {
-          // A assinatura existe/está ativa, mas o pagamento pode estar pendente.
-          if (!assinatura.data_ultimo_pagamento) {
-            atualizacao.status_assinatura =
-              'pagamento_pendente';
-          }
+          const statusLocalAssinatura =
+            String(assinatura.status_assinatura || '')
+              .trim()
+              .toLowerCase();
 
-          atualizacao.cancelado_em =
-            null;
+          const localTerminal =
+            statusLocalAssinatura === 'cancelado' ||
+            statusLocalAssinatura === 'canceled' ||
+            statusLocalAssinatura === 'expirado' ||
+            statusLocalAssinatura === 'expired';
+
+          if (!localTerminal) {
+            if (!assinatura.data_ultimo_pagamento) {
+              atualizacao.status_assinatura =
+                'pagamento_pendente';
+            }
+
+            atualizacao.cancelado_em =
+              null;
+          }
         }
      
         if (
@@ -3292,8 +3393,10 @@
           statusAtual === 'authorized' ||
           statusAtual === 'new'
         ) {
-          atualizacao.status_assinatura =
-            'pagamento_pendente';
+          if (!assinatura.data_ultimo_pagamento) {
+            atualizacao.status_assinatura =
+              'pagamento_pendente';
+          }
         }
 
         if (
@@ -4200,6 +4303,7 @@
 
           return res
             .status(
+              error.statusCode ||
               error.response
                 ?.status ||
               500
@@ -4243,15 +4347,26 @@
      
         try {
      
+          const usuario =
+            await obterUsuarioSupabaseDoBearer(req);
+
+          if (!usuario?.id) {
+            return res.status(401).json({
+              success: false,
+              error: 'Usuário não autenticado.',
+            });
+          }
+
           const {
             valor,
             cpf,
             nome,
             descricao,
-            usuario_id,
             origem_tipo,
             origem_id,
           } = req.body;
+
+          const usuario_id = String(usuario.id);
      
           if (!valor || !cpf) {
      
@@ -4439,6 +4554,7 @@
      
           return res
             .status(
+              error.statusCode ||
               error.response
                 ?.status ||
               500
@@ -4594,7 +4710,7 @@
           );
 
           return res
-            .status(error.response?.status || 500)
+            .status(error.statusCode || error.response?.status || 500)
             .json({
               success: false,
               error:
@@ -4616,6 +4732,16 @@
      
         try {
      
+          const usuario =
+            await obterUsuarioSupabaseDoBearer(req);
+
+          if (!usuario?.id) {
+            return res.status(401).json({
+              success: false,
+              error: 'Usuário não autenticado.',
+            });
+          }
+
           const {
             valor,
             email,
@@ -4625,10 +4751,23 @@
             payment_token,
             descricao,
             parcelas,
-            usuario_id,
             origem_tipo,
             origem_id,
           } = req.body;
+
+          const usuario_id = String(usuario.id);
+
+          // A conta Ache Obra pertence ao usuário autenticado.
+          // Estes campos representam o PAGADOR/TITULAR enviado à Efí e
+          // podem pertencer a outra pessoa autorizada.
+          const nomePagador =
+            String(req.body?.nome_pagador || nome || '').trim();
+          const cpfPagador =
+            String(req.body?.cpf_pagador || cpf || '').trim();
+          const emailPagador =
+            String(req.body?.email_pagador || email || '').trim();
+          const telefonePagador =
+            String(req.body?.telefone_pagador || telefone || '').trim();
      
           console.log(
             '=========================================='
@@ -4656,7 +4795,7 @@
               });
           }
      
-          if (!nome) {
+          if (!nomePagador) {
      
             return res
               .status(400)
@@ -4666,7 +4805,7 @@
               });
           }
      
-          if (!cpf) {
+          if (!cpfPagador) {
      
             return res
               .status(400)
@@ -4676,7 +4815,7 @@
               });
           }
      
-          if (!email) {
+          if (!emailPagador) {
      
             return res
               .status(400)
@@ -4696,7 +4835,7 @@
               });
           }
      
-          if (!telefone) {
+          if (!telefonePagador) {
      
             return res
               .status(400)
@@ -4706,32 +4845,22 @@
               });
           }
      
+          const valorResolvido =
+            await resolverValorPlanoNoBackend({
+              origemTipo: origem_tipo,
+              origemId: origem_id,
+              recorrente: false,
+              valorInformado: valor,
+            });
+
           const valorNumerico =
-            Number(valor);
-     
-          if (
-            !Number.isFinite(
-              valorNumerico
-            ) ||
-            valorNumerico <= 0
-          ) {
-     
-            return res
-              .status(400)
-              .json({
-                error:
-                  'Valor inválido.',
-              });
-          }
-     
+            valorResolvido.valor;
+
           const valorCentavos =
-            Math.round(
-              valorNumerico *
-              100
-            );
+            Math.round(valorNumerico * 100);
      
           const cpfLimpo =
-            String(cpf)
+            String(cpfPagador)
               .replace(/\D/g, '');
      
           if (
@@ -4748,7 +4877,7 @@
           }
      
           let telefoneLimpo =
-            String(telefone)
+            String(telefonePagador)
               .replace(/\D/g, '');
      
           if (
@@ -4833,16 +4962,13 @@
               credit_card: {
                 customer: {
                   name:
-                    String(nome)
-                      .trim(),
+                    nomePagador,
      
                   cpf:
                     cpfLimpo,
      
                   email:
-                    String(email)
-                      .trim()
-                      .toLowerCase(),
+                    emailPagador.toLowerCase(),
      
                   phone_number:
                     telefoneLimpo,
@@ -5272,6 +5398,7 @@
 
           return res
             .status(
+              error.statusCode ||
               error.response
                 ?.status ||
               500
@@ -5318,6 +5445,16 @@
      
         try {
      
+          const usuario =
+            await obterUsuarioSupabaseDoBearer(req);
+
+          if (!usuario?.id) {
+            return res.status(401).json({
+              success: false,
+              error: 'Usuário não autenticado.',
+            });
+          }
+
           const {
             valor,
             email,
@@ -5327,10 +5464,23 @@
             payment_token,
             descricao,
             plan_id,
-            usuario_id,
             origem_tipo,
             origem_id,
           } = req.body;
+
+          const usuario_id = String(usuario.id);
+
+          // A conta Ache Obra pertence ao usuário autenticado.
+          // Estes campos representam o PAGADOR/TITULAR enviado à Efí e
+          // podem pertencer a outra pessoa autorizada.
+          const nomePagador =
+            String(req.body?.nome_pagador || nome || '').trim();
+          const cpfPagador =
+            String(req.body?.cpf_pagador || cpf || '').trim();
+          const emailPagador =
+            String(req.body?.email_pagador || email || '').trim();
+          const telefonePagador =
+            String(req.body?.telefone_pagador || telefone || '').trim();
      
           console.log(
             '=========================================='
@@ -5374,7 +5524,7 @@
               });
           }
      
-          if (!nome) {
+          if (!nomePagador) {
      
             return res
               .status(400)
@@ -5387,7 +5537,7 @@
               });
           }
      
-          if (!cpf) {
+          if (!cpfPagador) {
      
             return res
               .status(400)
@@ -5400,7 +5550,7 @@
               });
           }
      
-          if (!email) {
+          if (!emailPagador) {
      
             return res
               .status(400)
@@ -5413,7 +5563,7 @@
               });
           }
      
-          if (!telefone) {
+          if (!telefonePagador) {
      
             return res
               .status(400)
@@ -5439,35 +5589,23 @@
               });
           }
      
+          const valorResolvido =
+            await resolverValorPlanoNoBackend({
+              origemTipo: origem_tipo,
+              origemId: origem_id,
+              recorrente: true,
+              valorInformado: valor,
+              planIdEfiInformado: plan_id,
+            });
+
           const valorNumerico =
-            Number(valor);
-     
-          if (
-            !Number.isFinite(
-              valorNumerico
-            ) ||
-            valorNumerico <= 0
-          ) {
-     
-            return res
-              .status(400)
-              .json({
-                success:
-                  false,
-     
-                error:
-                  'Valor da assinatura inválido.',
-              });
-          }
-     
+            valorResolvido.valor;
+
           const valorCentavos =
-            Math.round(
-              valorNumerico *
-              100
-            );
+            Math.round(valorNumerico * 100);
      
           const cpfLimpo =
-            String(cpf)
+            String(cpfPagador)
               .replace(/\D/g, '');
      
           if (
@@ -5487,7 +5625,7 @@
           }
      
           let telefoneLimpo =
-            String(telefone)
+            String(telefonePagador)
               .replace(/\D/g, '');
      
           if (
@@ -5525,8 +5663,10 @@
           }
      
           const planIdEfi =
-            String(plan_id)
-              .trim();
+            String(
+              valorResolvido.plano?.efi_plan_id ||
+              plan_id
+            ).trim();
      
           const accessToken =
             await obterTokenCobranca();
@@ -5580,16 +5720,13 @@
               credit_card: {
                 customer: {
                   name:
-                    String(nome)
-                      .trim(),
+                    nomePagador,
      
                   cpf:
                     cpfLimpo,
      
                   email:
-                    String(email)
-                      .trim()
-                      .toLowerCase(),
+                    emailPagador.toLowerCase(),
      
                   phone_number:
                     telefoneLimpo,
@@ -6173,6 +6310,7 @@
      
           return res
             .status(
+              error.statusCode ||
               error.response
                 ?.status ||
               500
@@ -6263,6 +6401,17 @@
             descricao,
           } = req.body || {};
 
+          // Dados enviados à Efí pertencem ao pagador/titular.
+          // O plano continua pertencendo ao usuário autenticado pelo Bearer.
+          const nomePagador =
+            String(req.body?.nome_pagador || nome || '').trim();
+          const cpfPagador =
+            String(req.body?.cpf_pagador || cpf || '').trim();
+          const emailPagador =
+            String(req.body?.email_pagador || email || '').trim();
+          const telefonePagador =
+            String(req.body?.telefone_pagador || telefone || '').trim();
+
           const novoPlanoId =
             String(plano_id || '').trim();
 
@@ -6276,7 +6425,7 @@
               });
           }
 
-          if (!nome || !cpf || !email || !telefone || !payment_token) {
+          if (!nomePagador || !cpfPagador || !emailPagador || !telefonePagador || !payment_token) {
             return res
               .status(400)
               .json({
@@ -6392,7 +6541,7 @@
           }
 
           const cpfLimpo =
-            String(cpf)
+            String(cpfPagador)
               .replace(/\D/g, '');
 
           if (cpfLimpo.length !== 11) {
@@ -6405,7 +6554,7 @@
           }
 
           let telefoneLimpo =
-            String(telefone)
+            String(telefonePagador)
               .replace(/\D/g, '');
 
           if (
@@ -6471,13 +6620,11 @@
               credit_card: {
                 customer: {
                   name:
-                    String(nome).trim(),
+                    nomePagador,
                   cpf:
                     cpfLimpo,
                   email:
-                    String(email)
-                      .trim()
-                      .toLowerCase(),
+                    emailPagador.toLowerCase(),
                   phone_number:
                     telefoneLimpo,
                 },
@@ -7649,7 +7796,7 @@
           }
 
           return res
-            .status(error.response?.status || 500)
+            .status(error.statusCode || error.response?.status || 500)
             .json({
               success: false,
               error: mensagem,
@@ -7784,7 +7931,7 @@
           const respostaEfi = error.response?.data;
           let mensagem = respostaEfi?.error_description || respostaEfi?.mensagem || respostaEfi?.message || respostaEfi?.error || error.message;
           if (typeof mensagem !== 'string') mensagem = JSON.stringify(mensagem);
-          return res.status(error.response?.status || 500).json({ success: false, error: mensagem, efi: respostaEfi || null });
+          return res.status(error.statusCode || error.response?.status || 500).json({ success: false, error: mensagem, efi: respostaEfi || null });
         }
       }
     );

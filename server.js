@@ -7002,11 +7002,67 @@
     // A Efí envia somente um token para notification_url.
     // O backend consulta GET /v1/notification/:token e processa
     // todos os eventos recebidos.
+    //
+    // IDEMPOTÊNCIA / CONCORRÊNCIA:
+    // A Efí pode entregar o mesmo notification token mais de uma vez
+    // e duas requisições podem chegar praticamente ao mesmo tempo.
+    //
+    // Proteção "single-flight" por token:
+    // - a primeira requisição processa normalmente;
+    // - uma requisição simultânea com o mesmo token NÃO reprocessa;
+    // - ela aguarda a execução original e reutiliza o mesmo resultado;
+    // - o lock é removido no finally, inclusive em caso de erro.
+    //
+    // A proteção financeira já existente por efi_charge_id continua
+    // intacta. Este bloco corrige somente a concorrência observada.
     // ============================================================
-     
+
+    const webhooksEfiEmProcessamento =
+      new Map();
+
+    async function processarWebhookEfiUmaVez(
+      notificationToken
+    ) {
+      const accessToken =
+        await obterTokenCobranca();
+
+      const eventos =
+        await consultarNotificacaoEfi(
+          accessToken,
+          notificationToken
+        );
+
+      const resultados = [];
+
+      for (const evento of eventos) {
+        const resultado =
+          await aplicarEventoNotificacaoEfi(
+            evento,
+            notificationToken
+          );
+
+        resultados.push(
+          resultado
+        );
+      }
+
+      await processarCarenciasVencidas();
+
+      console.log(
+        `>>> Webhook processado. Eventos: ${eventos.length}`
+      );
+
+      return {
+        success: true,
+        eventos:
+          eventos.length,
+        resultados,
+      };
+    }
+
     app.post(
       '/webhook/efi',
-     
+
       async (req, res) => {
         const notificationToken =
           String(
@@ -7015,12 +7071,12 @@
             req.query?.notification ||
             ''
           ).trim();
-     
+
         if (!notificationToken) {
           console.warn(
             '>>> Webhook Efí recebido sem token.'
           );
-     
+
           return res
             .status(400)
             .json({
@@ -7029,67 +7085,100 @@
                 'Token de notificação não informado.',
             });
         }
-     
+
+        const referenciaNotificacao =
+          referenciaSegura(
+            notificationToken
+          );
+
         console.log(
           '=========================================='
         );
-     
+
         console.log(
           '>>> WEBHOOK EFÍ RECEBIDO'
         );
-     
+
         console.log(
           '>>> Referência segura da notificação:',
-          referenciaSegura(notificationToken)
+          referenciaNotificacao
         );
-     
+
         console.log(
           '=========================================='
         );
-     
-        try {
-          const accessToken =
-            await obterTokenCobranca();
-     
-          const eventos =
-            await consultarNotificacaoEfi(
-              accessToken,
-              notificationToken
-            );
-     
-          const resultados = [];
-     
-          for (const evento of eventos) {
-            const resultado =
-              await aplicarEventoNotificacaoEfi(
-                evento,
-                notificationToken
-              );
-     
-            resultados.push(
-              resultado
-            );
-          }
-     
-          await processarCarenciasVencidas();
-     
-          console.log(
-            `>>> Webhook processado. Eventos: ${eventos.length}`
+
+        const processamentoExistente =
+          webhooksEfiEmProcessamento.get(
+            notificationToken
           );
-     
+
+        if (processamentoExistente) {
+          console.log(
+            `>>> Webhook Efí duplicado/concurrente detectado. Referência ${referenciaNotificacao}. Aguardando processamento original.`
+          );
+
+          try {
+            const resultado =
+              await processamentoExistente;
+
+            console.log(
+              `>>> Webhook Efí duplicado atendido pelo processamento original. Referência ${referenciaNotificacao}.`
+            );
+
+            return res.json({
+              ...resultado,
+              duplicado_concorrente:
+                true,
+            });
+
+          } catch (error) {
+            console.error(
+              '>>> ERRO NO WEBHOOK EFÍ DUPLICADO/CONCORRENTE:',
+              resumirErroSeguro(error)
+            );
+
+            return res
+              .status(
+                error.response?.status ||
+                500
+              )
+              .json({
+                success: false,
+                duplicado_concorrente:
+                  true,
+                error:
+                  resumirErroSeguro(error),
+              });
+          }
+        }
+
+        const processamento =
+          processarWebhookEfiUmaVez(
+            notificationToken
+          );
+
+        webhooksEfiEmProcessamento.set(
+          notificationToken,
+          processamento
+        );
+
+        try {
+          const resultado =
+            await processamento;
+
           return res.json({
-            success: true,
-            eventos:
-              eventos.length,
-            resultados,
+            ...resultado,
+            duplicado_concorrente:
+              false,
           });
-     
+
         } catch (error) {
           console.error(
             '>>> ERRO NO WEBHOOK EFÍ:',
             resumirErroSeguro(error)
           );
-     
+
           return res
             .status(
               error.response?.status ||
@@ -7097,13 +7186,26 @@
             )
             .json({
               success: false,
+              duplicado_concorrente:
+                false,
               error:
                 resumirErroSeguro(error),
             });
+
+        } finally {
+          if (
+            webhooksEfiEmProcessamento.get(
+              notificationToken
+            ) === processamento
+          ) {
+            webhooksEfiEmProcessamento.delete(
+              notificationToken
+            );
+          }
         }
       }
     );
-     
+
     // ============================================================
     // 4.1 DEVOLUÇÃO DE PAGAMENTO AVULSO PIX EM ATÉ 7 DIAS
     // ============================================================

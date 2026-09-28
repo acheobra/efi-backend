@@ -2166,7 +2166,7 @@
           id
         );
 
-      const assinaturaLocal =
+      let assinaturaLocal =
         await buscarAssinaturaPorSubscriptionId(id);
 
       const historico = Array.isArray(assinaturaEfi?.history)
@@ -2174,13 +2174,58 @@
         : [];
 
       let processados = 0;
+      let pagamentosConfirmados = 0;
+      let ultimoStatusConsultado = null;
 
       for (const item of historico) {
-        const chargeId = item?.charge_id;
+        const chargeId = String(item?.charge_id || '').trim();
 
         if (!chargeId) {
           continue;
         }
+
+        // IMPORTANTE:
+        // O history da assinatura pode permanecer com um snapshot antigo
+        // (new/waiting/approved) mesmo depois de a cobrança ter sido paga.
+        // Por isso a fonte de verdade financeira é GET /charge/:charge_id.
+        let cobrancaAtual = null;
+        let statusAtual = String(item?.status || '')
+          .trim()
+          .toLowerCase();
+
+        try {
+          cobrancaAtual =
+            await consultarCobrancaCartaoEfi(
+              accessToken,
+              chargeId
+            );
+
+          const statusConsultado = String(
+            cobrancaAtual?.status || ''
+          )
+            .trim()
+            .toLowerCase();
+
+          if (statusConsultado) {
+            statusAtual = statusConsultado;
+          }
+        } catch (erroConsultaCharge) {
+          console.warn(
+            `>>> Não foi possível consultar o estado atual da charge ${chargeId}; usando status do histórico da assinatura.`,
+            resumirErroSeguro(erroConsultaCharge)
+          );
+        }
+
+        ultimoStatusConsultado = statusAtual || ultimoStatusConsultado;
+
+        const dataPagamento =
+          normalizarDataIso(
+            cobrancaAtual?.paid_at ||
+            cobrancaAtual?.received_by_bank_at ||
+            cobrancaAtual?.payment?.paid_at ||
+            item?.paid_at ||
+            item?.received_by_bank_at
+          );
 
         await registrarHistoricoPagamentoRecorrente({
           assinatura: assinaturaLocal,
@@ -2190,7 +2235,7 @@
             assinaturaLocal?.efi_plan_id ||
             null,
           chargeId,
-          statusEfi: item?.status,
+          statusEfi: statusAtual,
           valor:
             assinaturaLocal?.valor_recorrente ??
             (
@@ -2198,29 +2243,184 @@
                 ? Number(assinaturaEfi.value) / 100
                 : null
             ),
+          valorCentavosEvento:
+            cobrancaAtual?.total ??
+            cobrancaAtual?.value ??
+            item?.value ??
+            null,
+          parcelas:
+            cobrancaAtual?.installments ||
+            cobrancaAtual?.parcel ||
+            null,
+          valorParcela:
+            Number.isFinite(Number(cobrancaAtual?.installment_value))
+              ? Number(cobrancaAtual.installment_value) / 100
+              : null,
           metodoPagamento:
+            cobrancaAtual?.payment_method ||
             assinaturaEfi?.payment_method ||
             'credit_card',
+          bandeiraCartao:
+            cobrancaAtual?.card_brand ||
+            cobrancaAtual?.payment?.credit_card?.brand ||
+            null,
           dataCobranca:
+            cobrancaAtual?.created_at ||
             item?.created_at ||
             assinaturaEfi?.created_at ||
+            null,
+          dataPagamento,
+          dataVencimento:
+            cobrancaAtual?.expire_at ||
+            item?.expire_at ||
+            null,
+          codigoRecusa:
+            cobrancaAtual?.refusal?.code ||
+            null,
+          motivoRecusa:
+            cobrancaAtual?.refusal?.message ||
+            cobrancaAtual?.refusal?.reason ||
             null,
           origemRegistro:
             'sincronizacao_assinatura',
           tipoEvento:
-            'subscription_history',
+            'subscription_charge',
         });
 
         processados++;
+
+        if (statusPagamentoRecorrenteEhPago(statusAtual) && assinaturaLocal) {
+          const dataPagamentoConfirmado =
+            dataPagamento ||
+            new Date().toISOString();
+
+          const finalizacao =
+            await finalizarAtivacaoAssinaturaPaga({
+              assinaturaNova: assinaturaLocal,
+              dataPagamento: dataPagamentoConfirmado,
+              accessTokenInformado: accessToken,
+              motivoTroca:
+                `Ativação automática após conciliação da cobrança ${chargeId} confirmada pela Efí.`,
+            });
+
+          assinaturaLocal =
+            finalizacao?.assinatura_nova ||
+            assinaturaLocal;
+
+          // finalizarAtivacaoAssinaturaPaga ativa o contrato e o plano do
+          // usuário. Aqui também consolidamos os campos usados pelo polling
+          // do Flutter para que a tela saia imediatamente de PROCESSANDO.
+          const assinaturaConsolidada =
+            await atualizarAssinaturaPorSubscriptionId(
+              id,
+              {
+                status_assinatura: 'ativo',
+                ultimo_status_efi: statusAtual,
+                efi_charge_id: chargeId,
+                data_ultimo_pagamento: dataPagamentoConfirmado,
+                data_inicio_inadimplencia: null,
+                data_fim_carencia: null,
+                cancelado_em: null,
+                motivo_cancelamento: null,
+              }
+            );
+
+          if (assinaturaConsolidada) {
+            assinaturaLocal = assinaturaConsolidada;
+          }
+
+          pagamentosConfirmados++;
+
+          console.log(
+            `>>> Conciliação confirmou pagamento da assinatura ${id}. Charge ${chargeId}: ${statusAtual}. Plano ativado.`
+          );
+        }
       }
 
       return {
         subscription_id: id,
         total_historico_efi: historico.length,
         cobranças_processadas: processados,
+        pagamentos_confirmados: pagamentosConfirmados,
+        ultimo_status_consultado: ultimoStatusConsultado,
         assinatura_local_encontrada:
           Boolean(assinaturaLocal),
+        assinatura_ativa:
+          String(assinaturaLocal?.status_assinatura || '')
+            .trim()
+            .toLowerCase() === 'ativo' &&
+          Boolean(assinaturaLocal?.data_ultimo_pagamento),
       };
+    }
+
+    // ============================================================
+    // CONCILIAÇÃO AUTOMÁTICA APÓS CRIAR ASSINATURA
+    // ============================================================
+    // O webhook continua sendo o mecanismo principal. Esta rotina é uma
+    // garantia adicional para o caso em que a Efí confirme a charge alguns
+    // segundos depois, mas a notificação recebida contenha apenas new/waiting.
+    // Não interfere em Pix nem em cobranças avulsas.
+    // ============================================================
+
+    const conciliacoesRecorrentesEmBackground = new Map();
+
+    function agendarConciliacaoRecorrenteEmBackground(
+      subscriptionId,
+      {
+        tentativas = 18,
+        intervaloMs = 10000,
+      } = {}
+    ) {
+      const id = String(subscriptionId || '').trim();
+
+      if (!id || conciliacoesRecorrentesEmBackground.has(id)) {
+        return;
+      }
+
+      const estado = {
+        cancelado: false,
+        timer: null,
+      };
+
+      conciliacoesRecorrentesEmBackground.set(id, estado);
+
+      const executar = async (tentativa) => {
+        try {
+          const resultado =
+            await sincronizarHistoricoPagamentosRecorrentesAssinatura(id);
+
+          if (resultado?.assinatura_ativa) {
+            console.log(
+              `>>> Conciliação automática concluída para assinatura ${id} na tentativa ${tentativa}/${tentativas}.`
+            );
+            conciliacoesRecorrentesEmBackground.delete(id);
+            return;
+          }
+        } catch (error) {
+          console.warn(
+            `>>> Conciliação automática da assinatura ${id} falhou na tentativa ${tentativa}/${tentativas}:`,
+            resumirErroSeguro(error)
+          );
+        }
+
+        if (tentativa >= tentativas) {
+          console.warn(
+            `>>> Conciliação automática da assinatura ${id} encerrou sem confirmação financeira após ${tentativas} tentativa(s).`
+          );
+          conciliacoesRecorrentesEmBackground.delete(id);
+          return;
+        }
+
+        estado.timer = setTimeout(
+          () => executar(tentativa + 1),
+          intervaloMs
+        );
+      };
+
+      estado.timer = setTimeout(
+        () => executar(1),
+        3000
+      );
     }
 
     // ============================================================
@@ -6190,6 +6390,20 @@
                     ? 'Assinatura criada na Efí. O contrato local está pendente de sincronização e o plano ainda não foi liberado.'
                     : 'Assinatura criada na Efí. O histórico da cobrança está pendente de sincronização e o plano ainda não foi liberado.',
               });
+          }
+
+          // Se a primeira cobrança ainda estiver em estado intermediário,
+          // inicia uma conciliação curta em background. O webhook permanece
+          // como mecanismo principal; esta rotina cobre notificações que
+          // chegam apenas como new/waiting/approved.
+          if (
+            subscriptionId &&
+            registroAssinaturaSalvo &&
+            !pagamentoConfirmado
+          ) {
+            agendarConciliacaoRecorrenteEmBackground(
+              String(subscriptionId)
+            );
           }
 
           return res

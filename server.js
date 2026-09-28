@@ -9383,6 +9383,144 @@
     }
 
 
+
+    // ============================================================
+    // RECONCILIAÇÃO PERSISTENTE DE ASSINATURAS PENDENTES
+    // ============================================================
+    //
+    // Recupera inclusive assinaturas pagas antes de deploy/restart.
+    // Não cria cobrança, não cobra cartão e não altera o fluxo Pix.
+    // ============================================================
+
+    let processandoAssinaturasPendentesPersistentes = false;
+
+    async function buscarAssinaturasPendentesParaReconciliacao({
+      limite = 100,
+    } = {}) {
+      const { supabaseUrl } = obterConfiguracaoSupabase();
+
+      const response = await requisicaoSupabaseInterna({
+        method: 'GET',
+        url: `${supabaseUrl}/rest/v1/tab_assinaturas`,
+        params: {
+          select: '*',
+          status_assinatura: 'eq.pagamento_pendente',
+          order: 'created_at.asc',
+          limit: Math.max(1, Math.min(Number(limite) || 100, 500)),
+        },
+        timeout: 30000,
+      });
+
+      return Array.isArray(response.data) ? response.data : [];
+    }
+
+    async function reconciliarAssinaturasPendentesPersistentes() {
+      if (processandoAssinaturasPendentesPersistentes) {
+        return {
+          processado: false,
+          motivo: 'reconciliacao_ja_em_andamento',
+        };
+      }
+
+      processandoAssinaturasPendentesPersistentes = true;
+
+      try {
+        const pendentes =
+          await buscarAssinaturasPendentesParaReconciliacao({
+            limite: 100,
+          });
+
+        if (pendentes.length === 0) {
+          return {
+            processado: true,
+            encontradas: 0,
+            ativadas: 0,
+          };
+        }
+
+        console.log(
+          `>>> Reconciliação persistente: ${pendentes.length} assinatura(s) pendente(s) encontrada(s).`
+        );
+
+        let ativadas = 0;
+        let aindaPendentes = 0;
+        let falhas = 0;
+
+        const accessToken =
+          await obterTokenCobranca();
+
+        for (const assinatura of pendentes) {
+          const subscriptionId =
+            String(
+              assinatura?.efi_subscription_id || ''
+            ).trim();
+
+          if (!subscriptionId) {
+            falhas++;
+            console.warn(
+              '>>> Assinatura pagamento_pendente sem efi_subscription_id. Registro ignorado:',
+              assinatura?.id || 'sem-id'
+            );
+            continue;
+          }
+
+          try {
+            const resultado =
+              await sincronizarHistoricoPagamentosRecorrentesAssinatura(
+                subscriptionId,
+                accessToken
+              );
+
+            if (resultado?.assinatura_ativa) {
+              ativadas++;
+              console.log(
+                `>>> Reconciliação persistente ATIVOU a assinatura ${subscriptionId}.`
+              );
+            } else {
+              aindaPendentes++;
+              console.log(
+                `>>> Reconciliação persistente: assinatura ${subscriptionId} ainda sem paid/settled. Status consultado: ${resultado?.ultimo_status_consultado || 'não informado'}.`
+              );
+            }
+          } catch (error) {
+            falhas++;
+            console.error(
+              `>>> Falha ao reconciliar assinatura pendente ${subscriptionId}:`,
+              resumirErroSeguro(error)
+            );
+          }
+
+          await aguardar(250);
+        }
+
+        console.log(
+          `>>> Reconciliação persistente concluída. Encontradas: ${pendentes.length}; ativadas: ${ativadas}; ainda pendentes: ${aindaPendentes}; falhas: ${falhas}.`
+        );
+
+        return {
+          processado: true,
+          encontradas: pendentes.length,
+          ativadas,
+          ainda_pendentes: aindaPendentes,
+          falhas,
+        };
+
+      } catch (error) {
+        console.error(
+          '>>> Erro geral na reconciliação persistente de assinaturas pendentes:',
+          resumirErroSeguro(error)
+        );
+
+        return {
+          processado: false,
+          erro: resumirErroSeguro(error),
+        };
+
+      } finally {
+        processandoAssinaturasPendentesPersistentes = false;
+      }
+    }
+
     // ============================================================
     // INICIAR SERVIDOR
     // ============================================================
@@ -9446,3 +9584,21 @@
     // Reprocessa devoluções Pix pendentes 20s após subir e depois a cada 5 minutos.
     setTimeout(() => { processarDevolucoesPixPendentes(); }, 20000);
     setInterval(() => { processarDevolucoesPixPendentes(); }, 5 * 60 * 1000);
+
+
+    // Reconciliador persistente das assinaturas recorrentes pendentes.
+    // Executa após deploy/restart e depois a cada 2 minutos.
+    // Apenas consulta/sincroniza: nunca cria uma nova cobrança.
+    setTimeout(
+      () => {
+        reconciliarAssinaturasPendentesPersistentes();
+      },
+      10000
+    );
+
+    setInterval(
+      () => {
+        reconciliarAssinaturasPendentesPersistentes();
+      },
+      2 * 60 * 1000
+    );

@@ -6122,16 +6122,23 @@
                 resumirErroSeguro(erroFinalizacaoAtivacao)
               );
 
+              // A cobrança já foi confirmada pela Efí. Uma falha transitória
+              // na promoção local NÃO transforma o pagamento em falha financeira.
+              // Mantemos a assinatura pendente de sincronização e deixamos o
+              // webhook/conciliação concluir a ativação com segurança.
               return res
-                .status(502)
+                .status(202)
                 .json({
-                  success: false,
+                  success: true,
                   approved: false,
                   pago: false,
                   pagamento_confirmado: true,
                   pagamento_pendente: true,
+                  sincronizacao_pendente: true,
                   status: status || null,
+                  status_efi: charge?.status || status || null,
                   subscription_id: subscriptionId,
+                  charge_id: charge?.charge_id || null,
                   charge: charge,
                   registro_assinatura_salvo:
                     registroAssinaturaSalvo,
@@ -6139,8 +6146,8 @@
                     charge?.charge_id
                       ? registroPagamentoRecorrenteSalvo
                       : null,
-                  error:
-                    'O pagamento foi confirmado, mas a ativação segura do novo plano ainda não pôde ser concluída. A assinatura anterior foi preservada.',
+                  message:
+                    'Pagamento confirmado pela Efí. A ativação do plano está sendo sincronizada e será concluída pelo webhook/conciliação.',
                 });
             }
           }
@@ -6155,16 +6162,22 @@
               )
             )
           ) {
+            // A assinatura já existe na Efí. Não devolvemos erro financeiro
+            // apenas porque a persistência/sincronização local ainda não terminou.
+            // O plano continua BLOQUEADO até a confirmação e a conciliação local.
             return res
-              .status(502)
+              .status(202)
               .json({
-                success: false,
+                success: true,
                 approved: false,
                 pago: false,
-                pagamento_confirmado: false,
+                pagamento_confirmado: pagamentoConfirmado,
                 pagamento_pendente: true,
+                sincronizacao_pendente: true,
                 status: status || null,
+                status_efi: charge?.status || status || null,
                 subscription_id: subscriptionId,
+                charge_id: charge?.charge_id || null,
                 charge: charge,
                 registro_assinatura_salvo:
                   registroAssinaturaSalvo,
@@ -6172,10 +6185,10 @@
                   registroPagamentoRecorrenteSalvo,
                 erro_registro_pagamento_recorrente:
                   erroRegistroPagamentoRecorrente,
-                error:
+                message:
                   !registroAssinaturaSalvo
-                    ? 'A assinatura foi criada na Efí, mas o contrato não pôde ser salvo em tab_assinaturas. O plano não foi liberado.'
-                    : 'A assinatura foi criada na Efí, mas a cobrança não pôde ser salva em tab_pagamentos_recorrentes. O plano não foi liberado.',
+                    ? 'Assinatura criada na Efí. O contrato local está pendente de sincronização e o plano ainda não foi liberado.'
+                    : 'Assinatura criada na Efí. O histórico da cobrança está pendente de sincronização e o plano ainda não foi liberado.',
               });
           }
 
@@ -6190,6 +6203,15 @@
      
               pago:
                 pagamentoConfirmado,
+
+              pagamento_confirmado:
+                pagamentoConfirmado,
+
+              pagamento_pendente:
+                !pagamentoConfirmado,
+
+              sincronizacao_pendente:
+                false,
      
               status:
                 status,
